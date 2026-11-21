@@ -1,24 +1,21 @@
-import { Image } from 'expo-image';
-import { LinearGradient } from 'expo-linear-gradient';
-import * as MediaLibrary from 'expo-media-library';
-import * as Sharing from 'expo-sharing';
-import { Check, CloudUpload, Download, Play, X } from 'lucide-react-native';
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import {
-  ActivityIndicator,
-  Alert,
-  Modal,
-  Platform,
-  Pressable,
-  RefreshControl,
-  ScrollView,
-  StyleSheet,
-  View,
-} from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
-
+import { FileSkeleton } from '@/components/ui/FileSkeleton';
+import { useSectionSlideAnimation } from '@/components/ui/AnimatedTabContainer';
 import { AppText } from '@/components/ui/AppText';
 import { AuroraBackdrop } from '@/components/ui/AuroraBackdrop';
+import {
+  DriveFileGridTile,
+  getDriveFileThumbnailSource,
+  getFileExtensionBadge,
+} from '@/components/ui/DriveFileGridTile';
+import { FileRow, FileRowKind } from '@/components/ui/FileRow';
+import {
+  FileViewToolbar,
+  getGridMetrics,
+  getSortLabel,
+  sortFileEntries,
+  useFileViewPreferences,
+} from '@/components/ui/FileViewToolbar';
+import { OnlineFileViewerModal } from '@/components/ui/OnlineFileViewerModal';
 import { ScreenHeader } from '@/components/ui/ScreenHeader';
 import { Segmented } from '@/components/ui/Segmented';
 import { Surface } from '@/components/ui/Surface';
@@ -27,338 +24,482 @@ import { useApp } from '@/context/app-context';
 import { useAppTheme } from '@/context/theme-context';
 import { DriveFile } from '@/lib/api';
 import { formatBytes, formatDateGroup, formatShortTime } from '@/lib/format';
+import * as MediaLibrary from 'expo-media-library';
+import * as Sharing from 'expo-sharing';
+import {
+  Check,
+  FileText,
+  Film,
+  Image as ImageIcon,
+  Layers,
+} from 'lucide-react-native';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Alert,
+  Animated,
+  FlatList,
+  Platform,
+  RefreshControl,
+  StyleSheet,
+  useWindowDimensions,
+  View,
+} from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 
-type MediaTab = 'all' | 'video' | 'album';
+type GalleryTab = 'everything' | 'image' | 'video' | 'document';
 
-const DEMO_GRADIENTS: readonly (readonly [string, string])[] = [
-  ['#FCD9A8', '#8B5CF6'],
-  ['#9AD7F5', '#1E3A6E'],
-  ['#B8F0D0', '#14532D'],
-  ['#FFE3B3', '#B4386A'],
-  ['#E0E7FF', '#4338CA'],
-  ['#CFFAFE', '#0E5E78'],
-];
+const TAB_ORDER: readonly GalleryTab[] = ['everything', 'image', 'video', 'document'];
+const PAGE_SIZE = 24;
 
-export default function FotoScreen() {
-  const { palette, theme } = useAppTheme();
-  const { api, queue } = useApp();
+type VirtualRow =
+  | { kind: 'group-header'; key: string; label: string; count: number }
+  | { kind: 'list-item'; key: string; file: DriveFile; isFirst: boolean; isLast: boolean }
+  | { kind: 'grid-row'; key: string; files: DriveFile[] };
 
-  const [tab, setTab] = useState<MediaTab>('all');
+function categoryToRowKind(cat: DriveFile['category']): FileRowKind {
+  if (
+    cat === 'image' ||
+    cat === 'video' ||
+    cat === 'audio' ||
+    cat === 'archive' ||
+    cat === 'document'
+  ) {
+    return cat;
+  }
+  return 'other';
+}
+
+export default function FileScreen() {
+  const { palette } = useAppTheme();
+  const { api, usage, queue, vaultToken, refreshServerInfo } = useApp();
+  const { width: windowWidth } = useWindowDimensions();
+
+  const { layout, sort, setLayout, setSort } = useFileViewPreferences(
+    'file_view_pref_backup_v1',
+    'grid3',
+    'newest',
+  );
+  const { columns, gap: gridGap, tileSize } = getGridMetrics(windowWidth, layout);
+
+  const [tab, setTab] = useState<GalleryTab>('everything');
+  const {
+    translateX: gridTranslateX,
+    opacity: gridOpacity,
+    animateSectionSwitch,
+  } = useSectionSlideAnimation();
+
   const [items, setItems] = useState<DriveFile[]>([]);
-  const [totalCount, setTotalCount] = useState(0);
-  const [loading, setLoading] = useState(false);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [counts, setCounts] = useState({
+    everything: 0,
+    image: 0,
+    video: 0,
+    document: 0,
+  });
+  const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [selected, setSelected] = useState<DriveFile | null>(null);
-  const [restoring, setRestoring] = useState(false);
-  const [limitedAccess, setLimitedAccess] = useState(false);
+  const loadingMoreRef = useRef(false);
 
+  const requestVersion = useRef<symbol | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
   const loadMedia = useCallback(async () => {
-    if (Platform.OS !== 'web') {
-      const perm = await MediaLibrary.getPermissionsAsync().catch(() => null);
-      setLimitedAccess(perm?.accessPrivileges === 'limited');
-    }
     if (!api) return;
+    const version = Symbol();
+    requestVersion.current = version;
     setLoading(true);
     try {
-      const res = await api.listMedia(tab === 'video' ? 'video' : 'all');
+      const res = await api.listMedia(tab, null, PAGE_SIZE);
+      if (version !== requestVersion.current) return;
       setItems(res.items);
-      setTotalCount(res.total_count);
+      setNextCursor(res.next_cursor ?? null);
+      if (res.counts) {
+        setCounts(res.counts);
+      } else {
+        setCounts((prev) => ({
+          ...prev,
+          [tab]: res.total_count,
+        }));
+      }
     } catch {
-      // Offline fallback
+      // Preserve last rendered items when offline
     } finally {
-      setLoading(false);
+      if (version === requestVersion.current) setLoading(false);
     }
   }, [api, tab]);
+
+  const loadMoreMedia = useCallback(async () => {
+    if (!api || !nextCursor || loading || loadingMoreRef.current) return;
+    const version = requestVersion.current;
+    loadingMoreRef.current = true;
+    setLoadingMore(true);
+    try {
+      const res = await api.listMedia(tab, nextCursor, PAGE_SIZE);
+      if (version !== requestVersion.current) return;
+      setItems((prev) => {
+        const seen = new Set(prev.map((f) => f.id));
+        const appended = res.items.filter((f) => !seen.has(f.id));
+        return [...prev, ...appended];
+      });
+      setNextCursor(res.next_cursor ?? null);
+      if (res.counts) {
+        setCounts(res.counts);
+      }
+    } catch {
+      // Keep existing loaded batch
+    } finally {
+      loadingMoreRef.current = false;
+      setLoadingMore(false);
+    }
+  }, [api, loading, nextCursor, tab]);
 
   useEffect(() => {
-    let active = true;
-    void (async () => {
-      if (Platform.OS !== 'web') {
-        const perm = await MediaLibrary.getPermissionsAsync().catch(() => null);
-        if (active) {
-          setLimitedAccess(perm?.accessPrivileges === 'limited');
+    const frame = requestAnimationFrame(() => void loadMedia());
+    return () => { cancelAnimationFrame(frame); requestVersion.current = null; };
+  }, [loadMedia, usage?.total_files]);
+
+  const sortedItems = useMemo(() => {
+    return sortFileEntries(items, sort, (item) => ({
+      name: item.name,
+      dateMs: new Date(item.media_taken_at ?? item.created_at).getTime() || 0,
+      sizeBytes: item.size_bytes,
+    }));
+  }, [items, sort]);
+
+  const virtualRows = useMemo<VirtualRow[]>(() => {
+    if (sortedItems.length === 0) return [];
+
+    let groups: [string, DriveFile[]][];
+    if (sort === 'newest' || sort === 'oldest') {
+      const map = new Map<string, DriveFile[]>();
+      for (const item of sortedItems) {
+        const key = formatDateGroup(item.media_taken_at ?? item.created_at);
+        const list = map.get(key) ?? [];
+        list.push(item);
+        map.set(key, list);
+      }
+      groups = Array.from(map.entries());
+    } else {
+      groups = [[`Urutan: ${getSortLabel(sort)}`, sortedItems]];
+    }
+
+    const rows: VirtualRow[] = [];
+    for (const [label, list] of groups) {
+      rows.push({
+        kind: 'group-header',
+        key: `hdr-${label}`,
+        label,
+        count: list.length,
+      });
+
+      if (layout === 'list') {
+        list.forEach((file, idx) => {
+          rows.push({
+            kind: 'list-item',
+            key: `li-${file.id}`,
+            file,
+            isFirst: idx === 0,
+            isLast: idx === list.length - 1,
+          });
+        });
+      } else {
+        for (let i = 0; i < list.length; i += columns) {
+          const chunk = list.slice(i, i + columns);
+          rows.push({
+            kind: 'grid-row',
+            key: `gr-${label}-${chunk[0].id}`,
+            files: chunk,
+          });
         }
       }
-      if (!api) return;
-      try {
-        const res = await api.listMedia(tab === 'video' ? 'video' : 'all');
-        if (!active) return;
-        setItems(res.items);
-        setTotalCount(res.total_count);
-      } catch {
-        // Offline fallback
-      }
-    })();
-    return () => {
-      active = false;
-    };
-  }, [api, tab]);
-
-  const groups = useMemo(() => {
-    const map = new Map<string, DriveFile[]>();
-    for (const item of items) {
-      const key = formatDateGroup(item.media_taken_at ?? item.created_at);
-      const list = map.get(key) ?? [];
-      list.push(item);
-      map.set(key, list);
     }
-    return Array.from(map.entries());
-  }, [items]);
+    return rows;
+  }, [columns, layout, sort, sortedItems]);
 
   const pendingCount = queue.filter(
-    (q) => q.sourceType === 'gallery' && (q.status === 'pending' || q.status === 'uploading'),
+    (q) => q.status === 'pending' || q.status === 'uploading',
   ).length;
 
-  const handleRestoreOriginal = async (file: DriveFile) => {
+  const handleDownloadAndSave = async (file: DriveFile) => {
     if (!api) return;
-    setRestoring(true);
     try {
       const { localUri } = await api.downloadAndVerify(file);
       if (Platform.OS !== 'web') {
-        const perm = await MediaLibrary.requestPermissionsAsync();
-        if (perm.granted) {
-          await MediaLibrary.Asset.create(localUri);
-          Alert.alert('Berhasil dipulihkan', `"${file.name}" diverifikasi SHA-256 dan disimpan ke galeri perangkat.`);
-        } else if (await Sharing.isAvailableAsync()) {
-          await Sharing.shareAsync(localUri);
+        if (file.category === 'image' || file.category === 'video') {
+          const perm = await MediaLibrary.requestPermissionsAsync(true).catch(() => null);
+          if (perm?.granted) {
+            await MediaLibrary.Asset.create(localUri);
+            Alert.alert(
+              'Berhasil disimpan',
+              `"${file.name}" diverifikasi SHA-256 dan disimpan ke galeri perangkat.`,
+            );
+            return;
+          }
+        }
+        if (await Sharing.isAvailableAsync()) {
+          await Sharing.shareAsync(localUri, { dialogTitle: `Simpan ${file.name}` });
+          return;
         }
       }
+      Alert.alert('Unduhan terverifikasi', `SHA-256 cocok. Berkas disimpan di ${localUri}`);
     } catch (err) {
-      Alert.alert('Gagal memulihkan', err instanceof Error ? err.message : 'Terjadi kesalahan.');
-    } finally {
-      setRestoring(false);
+      Alert.alert(
+        'Gagal mengunduh',
+        err instanceof Error ? err.message : 'Terjadi kesalahan saat mengunduh berkas.',
+      );
     }
   };
+
+  const handleMoveToPrivate = async (file: DriveFile) => {
+    if (!api) return;
+    if (!vaultToken) {
+      Alert.alert(
+        'Folder Privat terkunci',
+        'Buka tab Privat terlebih dahulu untuk memindahkan berkas ke Folder Privat.',
+      );
+      return;
+    }
+    try {
+      await api.moveFileIntoVault(vaultToken, file.id);
+      setSelected(null);
+      await Promise.all([loadMedia(), refreshServerInfo()]);
+      Alert.alert('Dipindahkan ke Privat', `"${file.name}" kini aman di Folder Privat.`);
+    } catch (err) {
+      Alert.alert(
+        'Gagal memindahkan',
+        err instanceof Error ? err.message : 'Terjadi kesalahan.',
+      );
+    }
+  };
+
+  const handleTrashFile = (file: DriveFile) => {
+    if (!api) return;
+    Alert.alert(
+      'Pindahkan ke Sampah?',
+      `Salinan "${file.name}" di server akan masuk Sampah selama 30 hari.`,
+      [
+        { text: 'Batal', style: 'cancel' },
+        {
+          text: 'Pindahkan ke Sampah',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              await api.trashFile(file.id);
+              setSelected(null);
+              await Promise.all([loadMedia(), refreshServerInfo()]);
+            } catch (err) {
+              Alert.alert(
+                'Gagal',
+                err instanceof Error ? err.message : 'Tidak dapat menghapus berkas.',
+              );
+            }
+          },
+        },
+      ],
+    );
+  };
+
+  const renderVirtualRow = useCallback(
+    ({ item }: { item: VirtualRow }) => {
+      if (item.kind === 'group-header') {
+        return (
+          <View style={styles.sectionPad}>
+            <View style={styles.groupHead}>
+              <AppText weight="bold" size={14.5}>
+                {item.label}
+              </AppText>
+              <View style={styles.okRow}>
+                <Check size={13.5} color={palette.success} strokeWidth={2.5} />
+                <AppText weight="semibold" size={12} color="success">
+                  {pendingCount > 0 ? `${pendingCount} antre · ` : ''}
+                  {item.count} item
+                </AppText>
+              </View>
+            </View>
+          </View>
+        );
+      }
+
+      if (item.kind === 'list-item') {
+        return (
+          <View style={styles.sectionPad}>
+            <Surface
+              style={[
+                item.isFirst && !item.isLast && styles.firstCard,
+                item.isLast && !item.isFirst && styles.lastCard,
+                !item.isFirst && !item.isLast && styles.middleCard,
+              ]}>
+              <FileRow
+                kind={categoryToRowKind(item.file.category)}
+                title={item.file.name}
+                subtitle={`${getFileExtensionBadge(item.file.name)} · ${formatBytes(item.file.size_bytes)} · ${formatShortTime(item.file.media_taken_at ?? item.file.created_at)}`}
+                mimeType={item.file.mime_type}
+                thumbnailPreset={item.file.thumbnail_preset}
+                thumbnailSource={getDriveFileThumbnailSource(api, item.file)}
+                showDivider={!item.isFirst}
+                onPress={() => setSelected(item.file)}
+              />
+            </Surface>
+          </View>
+        );
+      }
+
+      return (
+        <View style={[styles.sectionPad, { marginBottom: gridGap }]}>
+          <View style={[styles.gridRow, { gap: gridGap }]}>
+            {item.files.map((file) => (
+              <DriveFileGridTile
+                key={file.id}
+                file={file}
+                api={api}
+                size={tileSize}
+                layout={layout}
+                onPress={() => setSelected(file)}
+              />
+            ))}
+          </View>
+        </View>
+      );
+    },
+    [api, gridGap, layout, palette.success, pendingCount, tileSize],
+  );
 
   return (
     <AuroraBackdrop>
       <SafeAreaView style={styles.safe} edges={['top']}>
-        <ScrollView
+        <FlatList
+          data={virtualRows}
+          keyExtractor={(row) => row.key}
+          renderItem={renderVirtualRow}
           contentContainerStyle={styles.scrollPad}
+          onEndReached={() => void loadMoreMedia()}
+          onEndReachedThreshold={0.45}
+          initialNumToRender={12}
+          maxToRenderPerBatch={12}
+          windowSize={7}
+          removeClippedSubviews
           refreshControl={
             <RefreshControl
-              refreshing={loading}
-              onRefresh={() => void loadMedia()}
+              refreshing={refreshing}
+              onRefresh={() => { setRefreshing(true); void loadMedia().finally(() => setRefreshing(false)); }}
               tintColor={palette.accent}
             />
-          }>
-          <ScreenHeader
-            title="Foto"
-            subtitle={`${(api ? totalCount : 2431).toLocaleString('id-ID')} item`}
-          />
+          }
+          ListHeaderComponent={
+            <View>
+              <ScreenHeader
+                title="File"
+                subtitle={`${counts.everything.toLocaleString('id-ID')} berkas backup`}
+              />
 
-          <View style={styles.section}>
-            <Segmented
-              value={tab}
-              onChange={setTab}
-              options={[
-                { value: 'all', label: 'Semua' },
-                { value: 'video', label: 'Video' },
-                { value: 'album', label: 'Album' },
-              ]}
-            />
-
-            {limitedAccess ? (
-              <Surface solid style={styles.limitedBanner}>
-                <View style={{ flex: 1 }}>
-                  <AppText weight="bold" size={13}>
-                    Akses foto terbatas
-                  </AppText>
-                  <AppText size={12} color="secondary">
-                    Hanya foto pilihan Anda yang dapat dicadangkan otomatis.
-                  </AppText>
-                </View>
-                <Pressable
-                  onPress={() => {
-                    if (Platform.OS !== 'web') {
-                      void MediaLibrary.presentPermissionsPicker();
-                    }
-                  }}>
-                  <AppText weight="bold" size={13} color="accent">
-                    Ubah pilihan
-                  </AppText>
-                </Pressable>
-              </Surface>
-            ) : null}
-
-            {!api || groups.length === 0 ? (
-              <View style={{ marginTop: 14 }}>
-                <View style={styles.groupHead}>
-                  <AppText weight="bold" size={15}>
-                    {api ? 'Belum ada media tercadang' : 'Hari ini (contoh)'}
-                  </AppText>
-                  <View style={styles.okRow}>
-                    <Check size={14} color={palette.success} strokeWidth={2.5} />
-                    <AppText weight="semibold" size={12} color="success">
-                      {pendingCount > 0 ? `${pendingCount} antre` : 'Tersimpan'}
-                    </AppText>
-                  </View>
-                </View>
-
-                {!api ? (
-                  <View style={[styles.grid, { borderRadius: theme.radius.lg }]}>
-                    {DEMO_GRADIENTS.map((colors, idx) => (
-                      <View key={idx} style={styles.cell}>
-                        <LinearGradient
-                          colors={[colors[0], colors[1]]}
-                          style={StyleSheet.absoluteFill}
+              <View style={styles.sectionPad}>
+                <Segmented
+                  value={tab}
+                  onChange={(next) => {
+                    animateSectionSwitch(TAB_ORDER.indexOf(tab), TAB_ORDER.indexOf(next));
+                    setTab(next);
+                  }}
+                  options={[
+                    {
+                      value: 'everything',
+                      label: `Semua (${counts.everything})`,
+                      icon: (
+                        <Layers
+                          size={12}
+                          color={tab === 'everything' ? palette.segActiveFg : palette.textSecondary}
                         />
-                        {idx === 1 ? (
-                          <View style={styles.durPill}>
-                            <Play size={10} color="#fff" fill="#fff" />
-                            <AppText weight="bold" size={11} style={{ color: '#fff' }} tabular>
-                              0:42
-                            </AppText>
-                          </View>
-                        ) : null}
-                        {idx === 5 ? (
-                          <View style={styles.queueBadge}>
-                            <CloudUpload size={13} color="#fff" strokeWidth={2.2} />
-                          </View>
-                        ) : null}
-                      </View>
-                    ))}
-                  </View>
-                ) : (
-                  <Surface style={styles.emptyBox}>
-                    <AppText weight="semibold" size={14}>
-                      Galeri server masih kosong
-                    </AppText>
-                    <AppText size={12.5} color="secondary" style={{ marginTop: 4, textAlign: 'center' }}>
-                      Aktifkan Backup Galeri di tab Backup atau unggah foto dari tab Berkas.
-                    </AppText>
-                  </Surface>
-                )}
-              </View>
-            ) : (
-              groups.map(([dateLabel, list]) => (
-                <View key={dateLabel} style={{ marginTop: 16 }}>
-                  <View style={styles.groupHead}>
-                    <AppText weight="bold" size={15}>
-                      {dateLabel}
-                    </AppText>
-                    <View style={styles.okRow}>
-                      <Check size={14} color={palette.success} strokeWidth={2.5} />
-                      <AppText weight="semibold" size={12} color="success">
-                        Tersimpan · {list.length}
-                      </AppText>
-                    </View>
-                  </View>
+                      ),
+                    },
+                    {
+                      value: 'image',
+                      label: `Foto (${counts.image})`,
+                      icon: (
+                        <ImageIcon
+                          size={12}
+                          color={tab === 'image' ? palette.segActiveFg : palette.textSecondary}
+                        />
+                      ),
+                    },
+                    {
+                      value: 'video',
+                      label: `Video (${counts.video})`,
+                      icon: (
+                        <Film
+                          size={12}
+                          color={tab === 'video' ? palette.segActiveFg : palette.textSecondary}
+                        />
+                      ),
+                    },
+                    {
+                      value: 'document',
+                      label: `Dok (${counts.document})`,
+                      icon: (
+                        <FileText
+                          size={12}
+                          color={tab === 'document' ? palette.segActiveFg : palette.textSecondary}
+                        />
+                      ),
+                    },
+                  ]}
+                />
 
-                  <View style={[styles.grid, { borderRadius: theme.radius.lg }]}>
-                    {list.map((file) => (
-                      <Pressable
-                        key={file.id}
-                        style={styles.cell}
-                        onPress={() => setSelected(file)}
-                        accessibilityRole="button"
-                        accessibilityLabel={`Buka ${file.name}`}>
-                        {file.has_thumbnail ? (
-                          <Image
-                            source={{
-                              uri: api.thumbnailUrl(file.id),
-                              headers: api.authHeaders(),
-                            }}
-                            style={StyleSheet.absoluteFill}
-                            contentFit="cover"
-                          />
-                        ) : (
-                          <View
-                            style={[
-                              StyleSheet.absoluteFill,
-                              styles.fallbackCell,
-                              { backgroundColor: palette.surface },
-                            ]}>
-                            <AppText size={11} color="secondary" numberOfLines={1}>
-                              {file.category === 'video' ? 'VIDEO' : 'FOTO'}
-                            </AppText>
-                          </View>
-                        )}
-                        {file.category === 'video' ? (
-                          <View style={styles.durPill}>
-                            <Play size={10} color="#fff" fill="#fff" />
-                            <AppText weight="bold" size={10} style={{ color: '#fff' }}>
-                              Video
-                            </AppText>
-                          </View>
-                        ) : null}
-                      </Pressable>
-                    ))}
-                  </View>
-                </View>
-              ))
-            )}
-          </View>
-        </ScrollView>
-
-        {/* Fullscreen media preview modal */}
-        <Modal
-          visible={selected !== null}
-          transparent
-          animationType="fade"
-          onRequestClose={() => setSelected(null)}>
-          <View style={styles.previewOverlay}>
-            <SafeAreaView style={styles.previewInner}>
-              <View style={styles.previewTop}>
-                <View style={{ flex: 1 }}>
-                  <AppText weight="bold" size={15} style={{ color: '#FFFFFF' }} numberOfLines={1}>
-                    {selected?.name}
-                  </AppText>
-                  <AppText size={12} style={{ color: 'rgba(255,255,255,0.75)' }} tabular>
-                    {formatShortTime(selected?.media_taken_at ?? selected?.created_at)} ·{' '}
-                    {formatBytes(selected?.size_bytes)} · Tersimpan di server
-                  </AppText>
-                </View>
-                <Pressable
-                  onPress={() => setSelected(null)}
-                  accessibilityRole="button"
-                  accessibilityLabel="Tutup pratinjau"
-                  style={styles.closeBtn}>
-                  <X size={20} color="#FFFFFF" />
-                </Pressable>
-              </View>
-
-              <View style={styles.previewCenter}>
-                {selected && api && selected.category === 'image' ? (
-                  <Image
-                    source={{
-                      uri: api.contentUrl(selected.id, true),
-                      headers: api.authHeaders(),
-                    }}
-                    style={styles.fullImg}
-                    contentFit="contain"
+                <Animated.View
+                  style={{
+                    marginTop: 12,
+                    opacity: gridOpacity,
+                    transform: [{ translateX: gridTranslateX }],
+                  }}>
+                  <FileViewToolbar
+                    layout={layout}
+                    sort={sort}
+                    onChangeLayout={setLayout}
+                    onChangeSort={setSort}
                   />
-                ) : (
-                  <View style={styles.noPreview}>
-                    <AppText weight="bold" size={16} style={{ color: '#FFFFFF' }}>
-                      {selected?.name}
-                    </AppText>
-                    <AppText size={13} style={{ color: 'rgba(255,255,255,0.75)', marginTop: 6 }}>
-                      {selected?.mime_type} · {formatBytes(selected?.size_bytes)}
-                    </AppText>
-                  </View>
-                )}
+                </Animated.View>
               </View>
+            </View>
+          }
+          ListEmptyComponent={
+            <View style={styles.sectionPad}>
+              {loading ? (
+                <FileSkeleton layout={layout} />
+              ) : (
+                <Surface style={styles.emptyBox}>
+                  <AppText weight="bold" size={14.5}>
+                    {tab === 'everything'
+                      ? 'Belum ada hasil backup di server'
+                      : tab === 'image'
+                        ? 'Belum ada foto tercadang'
+                        : tab === 'video'
+                          ? 'Belum ada video tercadang'
+                          : 'Belum ada dokumen tercadang'}
+                  </AppText>
+                  <AppText
+                    size={12.5}
+                    color="secondary"
+                    style={{ marginTop: 5, textAlign: 'center', lineHeight: 18 }}>
+                    Seluruh berkas yang di-backup (baik di dalam folder maupun di luar folder)
+                    akan tampil otomatis tergabung di menu File ini.
+                  </AppText>
+                </Surface>
+              )}
+            </View>
+          }
+          ListFooterComponent={
+            loadingMore ? (
+              <FileSkeleton compact layout={layout} />
+            ) : undefined
+          }
+        />
 
-              {selected ? (
-                <Pressable
-                  disabled={restoring}
-                  onPress={() => void handleRestoreOriginal(selected)}
-                  style={[styles.restoreBtn, { backgroundColor: palette.accent }]}>
-                  {restoring ? (
-                    <ActivityIndicator color={palette.onAccent} />
-                  ) : (
-                    <>
-                      <Download size={18} color={palette.onAccent} strokeWidth={2.2} />
-                      <AppText weight="bold" size={14} color="onAccent">
-                        Simpan salinan asli (cek SHA-256)
-                      </AppText>
-                    </>
-                  )}
-                </Pressable>
-              ) : null}
-            </SafeAreaView>
-          </View>
-        </Modal>
+        <OnlineFileViewerModal
+          file={selected}
+          api={api}
+          onClose={() => setSelected(null)}
+          onDownload={(f) => handleDownloadAndSave(f)}
+          onMoveToPrivate={(f) => handleMoveToPrivate(f)}
+          onTrash={(f) => handleTrashFile(f)}
+        />
       </SafeAreaView>
     </AuroraBackdrop>
   );
@@ -367,18 +508,12 @@ export default function FotoScreen() {
 const styles = StyleSheet.create({
   safe: { flex: 1 },
   scrollPad: { paddingBottom: 140 },
-  section: { paddingHorizontal: Spacing.screen },
-  limitedBanner: {
-    marginTop: 12,
-    padding: 12,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
-  },
+  sectionPad: { paddingHorizontal: Spacing.screen },
   groupHead: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
+    marginTop: 16,
     marginBottom: 8,
     paddingHorizontal: 2,
   },
@@ -387,88 +522,35 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 4,
   },
-  grid: {
+  gridRow: {
     flexDirection: 'row',
-    flexWrap: 'wrap',
-    overflow: 'hidden',
-    gap: 3,
+    alignItems: 'flex-start',
   },
-  cell: {
-    width: '32.6%',
-    aspectRatio: 1,
-    position: 'relative',
-    overflow: 'hidden',
+  firstCard: {
+    borderBottomLeftRadius: 0,
+    borderBottomRightRadius: 0,
+    borderBottomWidth: 0,
   },
-  fallbackCell: {
-    alignItems: 'center',
-    justifyContent: 'center',
+  middleCard: {
+    borderRadius: 0,
+    borderTopWidth: 0,
+    borderBottomWidth: 0,
   },
-  durPill: {
-    position: 'absolute',
-    right: 6,
-    bottom: 6,
-    backgroundColor: 'rgba(0,0,0,0.55)',
-    borderRadius: 8,
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 3,
+  lastCard: {
+    borderTopLeftRadius: 0,
+    borderTopRightRadius: 0,
+    borderTopWidth: 0,
   },
-  queueBadge: {
-    position: 'absolute',
-    left: 6,
-    top: 6,
-    width: 24,
-    height: 24,
-    borderRadius: 12,
-    backgroundColor: 'rgba(15,18,40,0.6)',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  emptyBox: { padding: 24, alignItems: 'center' },
-  previewOverlay: {
-    flex: 1,
-    backgroundColor: 'rgba(5, 7, 16, 0.96)',
-  },
-  previewInner: {
-    flex: 1,
-    paddingHorizontal: 18,
-    paddingBottom: 18,
-  },
-  previewTop: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 12,
-    paddingVertical: 12,
-  },
-  closeBtn: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
-    backgroundColor: 'rgba(255,255,255,0.14)',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  previewCenter: {
-    flex: 1,
-    justifyContent: 'center',
+  emptyBox: {
+    marginTop: 16,
+    padding: 26,
     alignItems: 'center',
   },
-  fullImg: {
-    width: '100%',
-    height: '100%',
-  },
-  noPreview: {
-    alignItems: 'center',
-    padding: 24,
-  },
-  restoreBtn: {
-    height: 48,
-    borderRadius: 999,
+  loadMoreFooter: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
     gap: 8,
+    paddingVertical: 18,
   },
 });

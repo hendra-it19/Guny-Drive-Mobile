@@ -1,6 +1,7 @@
+import { ActionPressable } from '@/components/ui/ActionPressable';
 import { Search, X } from 'lucide-react-native';
 import React from 'react';
-import { Pressable, StyleSheet, TextInput } from 'react-native';
+import { StyleSheet, TextInput } from 'react-native';
 
 import { FontFamily } from '@/constants/theme';
 import { useAppTheme } from '@/context/theme-context';
@@ -39,13 +40,13 @@ export function SearchField({
         ]}
       />
       {value.length > 0 ? (
-        <Pressable
+        <ActionPressable
           onPress={() => onChangeText('')}
           accessibilityRole="button"
           accessibilityLabel="Hapus pencarian"
           hitSlop={10}>
           <X size={16} color={palette.textSecondary} strokeWidth={2} />
-        </Pressable>
+        </ActionPressable>
       ) : null}
     </Surface>
   );

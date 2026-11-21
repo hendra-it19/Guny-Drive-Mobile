@@ -1,19 +1,28 @@
-import * as DocumentPicker from 'expo-document-picker';
+import { FileSkeleton } from '@/components/ui/FileSkeleton';
+import { ActionPressable } from '@/components/ui/ActionPressable';
 import { useRouter } from 'expo-router';
 import * as Sharing from 'expo-sharing';
 import {
-  ArrowUpDown,
+  Check,
+  CheckSquare,
   ChevronLeft,
-  Download,
+  ClipboardPaste,
+  Copy,
+  Edit3,
+  Folder as FolderIcon,
+  FolderOpen,
   FolderPlus,
   Lock,
+  Scissors,
   Trash2,
   Upload,
+  X,
 } from 'lucide-react-native';
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  Animated,
   FlatList,
   Modal,
   Platform,
@@ -22,80 +31,119 @@ import {
   ScrollView,
   StyleSheet,
   TextInput,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import { useSectionSlideAnimation } from '@/components/ui/AnimatedTabContainer';
 import { AppText } from '@/components/ui/AppText';
 import { AuroraBackdrop } from '@/components/ui/AuroraBackdrop';
-import { BackupCard } from '@/components/ui/BackupCard';
 import { Chip } from '@/components/ui/Chip';
+import { DeviceFileManager } from '@/components/ui/DeviceFileManager';
+import {
+  DriveFileGridTile,
+  getDriveFileThumbnailSource,
+} from '@/components/ui/DriveFileGridTile';
 import { FabButton } from '@/components/ui/FabButton';
 import { FileRow, FileRowKind } from '@/components/ui/FileRow';
+import {
+  FileViewToolbar,
+  getGridMetrics,
+  sortFileEntries,
+  useFileViewPreferences,
+} from '@/components/ui/FileViewToolbar';
+import { OnlineFileViewerModal } from '@/components/ui/OnlineFileViewerModal';
 import { ScreenHeader } from '@/components/ui/ScreenHeader';
 import { SearchField } from '@/components/ui/SearchField';
+import { Segmented } from '@/components/ui/Segmented';
 import { Surface } from '@/components/ui/Surface';
 import { FontFamily, Spacing } from '@/constants/theme';
 import { useApp } from '@/context/app-context';
 import { useAppTheme } from '@/context/theme-context';
 import { DriveFile, DriveFolder } from '@/lib/api';
 import { uploadLocalFileDirect } from '@/lib/backup-engine';
+import {
+  notifyPermissionRefresh,
+  type scanAllDeviceFiles,
+  subscribePermissionRefresh,
+  pickLocalFilesWithoutCopy,
+  requestDeviceDirectoryPermission,
+} from '@/lib/device-files';
 import { formatBytes, formatShortTime } from '@/lib/format';
 
 type FilterCategory = 'all' | 'document' | 'media' | 'archive';
-type SortKey = 'date' | 'name' | 'size';
 
 type ListEntry =
   | { kind: 'folder'; folder: DriveFolder }
   | { kind: 'file'; file: DriveFile }
   | { kind: 'private-shortcut' };
 
-const DEMO_FILES: DriveFile[] = [
-  {
-    id: 'demo-pdf',
-    folder_id: null,
-    space: 'regular',
-    name: 'Catatan.pdf',
-    size_bytes: 1_248_000,
-    sha256: '0'.repeat(64),
-    mime_type: 'application/pdf',
-    category: 'document',
-    has_preview: true,
-    has_thumbnail: false,
-    media_taken_at: null,
-    status: 'ready',
-    deleted_at: null,
-    purge_after_at: null,
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
-  },
-];
+type CloudVirtualRow =
+  | { kind: 'list-entry'; key: string; entry: ListEntry; index: number; total: number }
+  | { kind: 'grid-row'; key: string; entries: ListEntry[] };
 
-const DEMO_FOLDERS: DriveFolder[] = [
-  {
-    id: 'demo-folder',
-    parent_id: null,
-    space: 'regular',
-    name: 'Perjalanan',
-    files_count: 12,
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
-  },
-];
+type CloudClipboardItem =
+  | { kind: 'file'; file: DriveFile }
+  | { kind: 'folder'; folder: DriveFolder };
+
+type CloudClipboard = {
+  mode: 'copy' | 'cut';
+  sourceFolderId: string | null;
+  items: CloudClipboardItem[];
+};
+
+const PAGE_SIZE = 24;
 
 export default function BerkasScreen() {
   const router = useRouter();
   const { palette } = useAppTheme();
-  const { api, usage, backupRules, queue, vaultToken, refreshServerInfo } = useApp();
+  const { api, usage, vaultToken, refreshServerInfo, refreshQueue } = useApp();
+  const { width: windowWidth } = useWindowDimensions();
 
+  const {
+    layout: cloudLayout,
+    sort: cloudSort,
+    setLayout: setCloudLayout,
+    setSort: setCloudSort,
+  } = useFileViewPreferences('file_view_pref_cloud_v1', 'list', 'newest');
+  const { columns: cloudColumns, gap: cloudGridGap, tileSize: cloudTileSize } = getGridMetrics(
+    windowWidth,
+    cloudLayout,
+  );
+
+  const scanCacheRef = useMemo(() => ({ account: api, current: null as Awaited<ReturnType<typeof scanAllDeviceFiles>> | null }), [api]);
+  useEffect(() => {
+    const clear = () => { scanCacheRef.current = null; };
+    const unsubscribe = subscribePermissionRefresh(clear);
+    return () => { unsubscribe(); };
+  }, [scanCacheRef]);
+  const [sourceScope, setSourceScope] = useState<'device' | 'cloud'>('device');
+  const {
+    translateX: scopeTranslateX,
+    opacity: scopeOpacity,
+    animateSectionSwitch,
+  } = useSectionSlideAnimation();
+
+  // Cloud directory state (with cursor-based infinite scroll)
   const [folderId, setFolderId] = useState<string | null>(null);
   const [breadcrumbs, setBreadcrumbs] = useState<{ id: string; name: string }[]>([]);
   const [query, setQuery] = useState('');
   const [category, setCategory] = useState<FilterCategory>('all');
-  const [sort, setSort] = useState<SortKey>('name');
-  const [folders, setFolders] = useState<DriveFolder[]>(DEMO_FOLDERS);
-  const [files, setFiles] = useState<DriveFile[]>(DEMO_FILES);
+  const [folders, setFolders] = useState<DriveFolder[]>([]);
+  const [files, setFiles] = useState<DriveFile[]>([]);
+  const [cloudNextCursor, setCloudNextCursor] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [loadingMoreCloud, setLoadingMoreCloud] = useState(false);
+  const loadingMoreCloudRef = useRef(false);
+
+  // Unified all-folders cloud catalog so Sistem HP always shows backed-up files (even those uploaded inside folders!)
+  const [allCloudFiles, setAllCloudFiles] = useState<DriveFile[]>([]);
+  const [allCloudNextCursor, setAllCloudNextCursor] = useState<string | null>(null);
+  const [loadingMoreAllCloud, setLoadingMoreAllCloud] = useState(false);
+  const loadingMoreAllRef = useRef(false);
+  const [deviceLoadMoreSignal, setDeviceLoadMoreSignal] = useState(0);
 
   const [addSheetOpen, setAddSheetOpen] = useState(false);
   const [newFolderModal, setNewFolderModal] = useState(false);
@@ -103,11 +151,26 @@ export default function BerkasScreen() {
   const [selectedFile, setSelectedFile] = useState<DriveFile | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
 
+  // Cloud Server Explorer: Multi-select, Copy/Cut/Paste Clipboard, Rename, Folder Controls
+  const [cloudSelectMode, setCloudSelectMode] = useState(false);
+  const [cloudSelectedKeys, setCloudSelectedKeys] = useState<Set<string>>(() => new Set());
+  const [clipboard, setClipboard] = useState<CloudClipboard | null>(null);
+  const [renameTarget, setRenameTarget] = useState<CloudClipboardItem | null>(null);
+  const [renameInput, setRenameInput] = useState('');
+
+  const apiSortKey: 'date' | 'name' | 'size' =
+    cloudSort === 'name_asc' || cloudSort === 'name_desc'
+      ? 'name'
+      : cloudSort === 'size_desc' || cloudSort === 'size_asc'
+        ? 'size'
+        : 'date';
+
   const fetchDirectory = useCallback(async () => {
     if (!api) {
-      setFolders(DEMO_FOLDERS);
-      setFiles(DEMO_FILES);
+      setFolders([]);
+      setFiles([]);
       setBreadcrumbs([]);
+      setCloudNextCursor(null);
       return;
     }
     setLoading(true);
@@ -116,55 +179,163 @@ export default function BerkasScreen() {
         folderId,
         q: query.trim() || undefined,
         category,
-        sort,
+        sort: apiSortKey,
+        perPage: PAGE_SIZE,
       });
       setFolders(res.folders);
       setFiles(res.files);
       setBreadcrumbs(res.breadcrumbs);
+      setCloudNextCursor(res.next_cursor ?? null);
     } catch {
       // Offline — preserve last rendered items.
     } finally {
       setLoading(false);
     }
-  }, [api, category, folderId, query, sort]);
+  }, [api, apiSortKey, category, folderId, query]);
+
+  const loadMoreCloudDirectory = useCallback(async () => {
+    if (!api || !cloudNextCursor || loading || loadingMoreCloudRef.current) return;
+    loadingMoreCloudRef.current = true;
+    setLoadingMoreCloud(true);
+    try {
+      const res = await api.listFiles({
+        folderId,
+        q: query.trim() || undefined,
+        category,
+        sort: apiSortKey,
+        cursor: cloudNextCursor,
+        perPage: PAGE_SIZE,
+      });
+      setFiles((prev) => {
+        const seen = new Set(prev.map((f) => f.id));
+        return [...prev, ...res.files.filter((f) => !seen.has(f.id))];
+      });
+      setCloudNextCursor(res.next_cursor ?? null);
+    } catch {
+      // Keep current loaded list
+    } finally {
+      loadingMoreCloudRef.current = false;
+      setLoadingMoreCloud(false);
+    }
+  }, [api, apiSortKey, category, cloudNextCursor, folderId, loading, query]);
+
+  const fetchAllCloudFiles = useCallback(async () => {
+    if (!api) {
+      setAllCloudFiles([]);
+      setAllCloudNextCursor(null);
+      return;
+    }
+    try {
+      const res = await api.listMedia('everything', null, 48);
+      setAllCloudFiles(res.items);
+      setAllCloudNextCursor(res.next_cursor ?? null);
+    } catch {
+      // Keep last synced list
+    }
+  }, [api]);
+
+  const loadMoreAllCloudFiles = useCallback(async () => {
+    if (!api || !allCloudNextCursor || loadingMoreAllRef.current) return;
+    loadingMoreAllRef.current = true;
+    setLoadingMoreAllCloud(true);
+    try {
+      const res = await api.listMedia('everything', allCloudNextCursor, 48);
+      setAllCloudFiles((prev) => {
+        const seen = new Set(prev.map((f) => f.id));
+        return [...prev, ...res.items.filter((f) => !seen.has(f.id))];
+      });
+      setAllCloudNextCursor(res.next_cursor ?? null);
+    } catch {
+      // Keep existing
+    } finally {
+      loadingMoreAllRef.current = false;
+      setLoadingMoreAllCloud(false);
+    }
+  }, [allCloudNextCursor, api]);
+
+  const refreshAll = useCallback(async () => {
+    await Promise.all([fetchDirectory(), fetchAllCloudFiles()]);
+  }, [fetchAllCloudFiles, fetchDirectory]);
 
   useEffect(() => {
+    // Only fetch cloud directory immediately when Cloud tab is active; otherwise defer so UI opens smoothly
+    const delay = sourceScope === 'cloud' ? 80 : 900;
     const t = setTimeout(() => {
       void fetchDirectory();
-    }, 120);
+    }, delay);
     return () => clearTimeout(t);
-  }, [fetchDirectory]);
+  }, [fetchDirectory, sourceScope, usage?.total_files]);
 
-  const cycleSort = () => {
-    setSort((prev) => (prev === 'name' ? 'date' : prev === 'date' ? 'size' : 'name'));
-  };
+  useEffect(() => {
+    if (!api) return;
+    let active = true;
+    void api
+      .listMedia('everything', null, 48)
+      .then((res) => {
+        if (!active) return;
+        setAllCloudFiles(res.items);
+        setAllCloudNextCursor(res.next_cursor ?? null);
+      })
+      .catch(() => {
+        // Keep last synced list
+      });
+    return () => {
+      active = false;
+    };
+  }, [api, usage?.total_files]);
 
-  const sortLabel = sort === 'name' ? 'Nama' : sort === 'size' ? 'Ukuran' : 'Terbaru';
-
-  const handleUploadManual = async () => {
+  // Unified Upload WITHOUT copying to local app storage -> appears immediately in BOTH Cloud & Sistem HP!
+  const handleUploadDirect = async () => {
     setAddSheetOpen(false);
     if (!api) {
       router.push('/settings/connect');
       return;
     }
-    const picked = await DocumentPicker.getDocumentAsync({ copyToCacheDirectory: true });
-    if (picked.canceled || !picked.assets?.[0]) return;
-    const asset = picked.assets[0];
-    setBusyAction(`Mengunggah ${asset.name}…`);
+    const pickedFiles = await pickLocalFilesWithoutCopy();
+    if (pickedFiles.length === 0) return;
+
+    let uploadedCount = 0;
     try {
-      await uploadLocalFileDirect({
-        api,
-        localUri: asset.uri,
-        filename: asset.name,
-        mimeType: asset.mimeType || 'application/octet-stream',
-        space: 'regular',
-        folderId,
-      });
-      await Promise.all([fetchDirectory(), refreshServerInfo()]);
+      for (const asset of pickedFiles) {
+        setBusyAction(
+          pickedFiles.length > 1
+            ? `Mengunggah ${asset.name} (${uploadedCount + 1}/${pickedFiles.length})…`
+            : `Mengunggah ${asset.name}…`,
+        );
+        await uploadLocalFileDirect({
+          api,
+          localUri: asset.uri,
+          filename: asset.name,
+          mimeType: asset.mimeType,
+          space: 'regular',
+          folderId: sourceScope === 'cloud' ? folderId : null,
+          existingServerFiles: allCloudFiles,
+        });
+        uploadedCount++;
+      }
+      await Promise.all([refreshAll(), refreshServerInfo(), refreshQueue()]);
     } catch (err) {
-      Alert.alert('Unggah gagal', err instanceof Error ? err.message : 'Gagal mengunggah berkas.');
+      Alert.alert(
+        'Unggah gagal',
+        err instanceof Error ? err.message : 'Gagal mengunggah berkas.',
+      );
     } finally {
       setBusyAction(null);
+    }
+  };
+
+  const handleConnectFolder = async () => {
+    setAddSheetOpen(false);
+    try {
+      const folder = await requestDeviceDirectoryPermission();
+      if (folder) {
+        notifyPermissionRefresh();
+      }
+    } catch (err) {
+      Alert.alert(
+        'Gagal memilih folder',
+        err instanceof Error ? err.message : 'Pemilihan folder dibatalkan.',
+      );
     }
   };
 
@@ -186,11 +357,8 @@ export default function BerkasScreen() {
   };
 
   const handleDownloadFile = async (file: DriveFile) => {
-    if (!api) {
-      Alert.alert('Mode pratinjau', 'Hubungkan server pribadi Anda di Pengaturan untuk mengunduh berkas asli.');
-      return;
-    }
-    setBusyAction(`Mengunduh & memeriksa SHA-256 ${file.name}…`);
+    if (!api) return;
+    setBusyAction(`Mengunduh ${file.name}…`);
     try {
       const { localUri } = await api.downloadAndVerify(file);
       if (Platform.OS !== 'web' && (await Sharing.isAvailableAsync())) {
@@ -220,7 +388,7 @@ export default function BerkasScreen() {
             try {
               await api.trashFile(file.id);
               setSelectedFile(null);
-              await Promise.all([fetchDirectory(), refreshServerInfo()]);
+              await Promise.all([refreshAll(), refreshServerInfo(), refreshQueue()]);
             } catch (err) {
               Alert.alert('Gagal', err instanceof Error ? err.message : 'Tidak dapat membuang berkas.');
             }
@@ -239,37 +407,274 @@ export default function BerkasScreen() {
     try {
       await api.moveFileIntoVault(vaultToken, file.id);
       setSelectedFile(null);
-      await fetchDirectory();
-      Alert.alert('Dipindahkan ke Privat', `"${file.name}" sekarang hanya dapat diakses melalui Folder Privat.`);
+      await Promise.all([refreshAll(), refreshServerInfo()]);
+      Alert.alert('Dipindahkan ke Privat', `"${file.name}" sekarang aman di Folder Privat.`);
     } catch (err) {
       Alert.alert('Gagal memindahkan', err instanceof Error ? err.message : 'Terjadi kesalahan.');
     }
   };
 
-  const usedBytes = usage?.used_bytes ?? 45_956_150_067;
+  const entryKey = (item: CloudClipboardItem): string =>
+    item.kind === 'folder' ? `folder:${item.folder.id}` : `file:${item.file.id}`;
+
+  const exitCloudSelectMode = useCallback(() => {
+    setCloudSelectMode(false);
+    setCloudSelectedKeys(new Set());
+  }, []);
+
+  const toggleCloudSelect = useCallback((item: CloudClipboardItem) => {
+    const key = item.kind === 'folder' ? `folder:${item.folder.id}` : `file:${item.file.id}`;
+    setCloudSelectMode(true);
+    setCloudSelectedKeys((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
+
+  const selectedCloudItems = useMemo<CloudClipboardItem[]>(() => {
+    if (cloudSelectedKeys.size === 0) return [];
+    const list: CloudClipboardItem[] = [];
+    for (const folder of folders) {
+      if (cloudSelectedKeys.has(`folder:${folder.id}`)) {
+        list.push({ kind: 'folder', folder });
+      }
+    }
+    for (const file of files) {
+      if (cloudSelectedKeys.has(`file:${file.id}`)) {
+        list.push({ kind: 'file', file });
+      }
+    }
+    return list;
+  }, [cloudSelectedKeys, files, folders]);
+
+  const handleToggleSelectAllCloud = () => {
+    const allKeys = [
+      ...folders.map((f) => `folder:${f.id}`),
+      ...files.map((f) => `file:${f.id}`),
+    ];
+    if (allKeys.length > 0 && allKeys.every((k) => cloudSelectedKeys.has(k))) {
+      setCloudSelectedKeys(new Set());
+    } else {
+      setCloudSelectedKeys(new Set(allKeys));
+    }
+  };
+
+  const handleStartClipboard = (mode: 'copy' | 'cut', items: CloudClipboardItem[]) => {
+    if (items.length === 0) return;
+    setClipboard({ mode, sourceFolderId: folderId, items });
+    exitCloudSelectMode();
+  };
+
+  const handlePasteClipboard = async () => {
+    if (!api || !clipboard || clipboard.items.length === 0) return;
+    const { mode, items } = clipboard;
+    setBusyAction(
+      mode === 'copy'
+        ? `Menyalin ${items.length} item ke folder ini…`
+        : `Memindahkan ${items.length} item ke folder ini…`,
+    );
+    let okCount = 0;
+    let errMessage: string | null = null;
+    try {
+      for (let i = 0; i < items.length; i++) {
+        const entry = items[i];
+        try {
+          if (entry.kind === 'file') {
+            if (mode === 'copy') {
+              await api.copyFile(entry.file.id, folderId);
+            } else {
+              await api.updateFile(entry.file.id, { folder_id: folderId });
+            }
+          } else {
+            if (mode === 'copy') {
+              await api.copyFolder(entry.folder.id, folderId);
+            } else {
+              await api.updateFolder(entry.folder.id, { parent_id: folderId });
+            }
+          }
+          okCount++;
+        } catch (err) {
+          errMessage = err instanceof Error ? err.message : 'Sebagian item gagal diproses.';
+        }
+      }
+      setClipboard(null);
+      await Promise.all([refreshAll(), refreshServerInfo()]);
+      if (errMessage) {
+        Alert.alert(
+          okCount > 0 ? 'Sebagian Berhasil' : 'Gagal Menempel',
+          okCount > 0 ? `${okCount} berhasil. ${errMessage}` : errMessage,
+        );
+      }
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleOpenRename = (target: CloudClipboardItem) => {
+    setRenameTarget(target);
+    setRenameInput(target.kind === 'folder' ? target.folder.name : target.file.name);
+  };
+
+  const handleConfirmRename = async () => {
+    if (!api || !renameTarget) return;
+    const clean = renameInput.trim();
+    if (!clean) return;
+    const target = renameTarget;
+    setRenameTarget(null);
+    setBusyAction('Mengubah nama…');
+    try {
+      if (target.kind === 'folder') {
+        await api.updateFolder(target.folder.id, { name: clean });
+      } else {
+        await api.updateFile(target.file.id, { name: clean });
+      }
+      exitCloudSelectMode();
+      await refreshAll();
+    } catch (err) {
+      Alert.alert('Gagal Mengubah Nama', err instanceof Error ? err.message : 'Terjadi kesalahan.');
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleBatchMoveToPrivate = async () => {
+    if (!api) return;
+    const targetFiles = selectedCloudItems
+      .filter((it): it is { kind: 'file'; file: DriveFile } => it.kind === 'file')
+      .map((it) => it.file);
+    if (targetFiles.length === 0) return;
+    if (!vaultToken) {
+      Alert.alert(
+        'Folder Privat Terkunci',
+        'Buka tab Privat dan masukkan PIN terlebih dahulu untuk memindahkan berkas ke ruang Privat.',
+      );
+      return;
+    }
+    setBusyAction(`Memindahkan ${targetFiles.length} berkas ke Privat…`);
+    try {
+      for (const f of targetFiles) {
+        await api.moveFileIntoVault(vaultToken, f.id);
+      }
+      exitCloudSelectMode();
+      await Promise.all([refreshAll(), refreshServerInfo()]);
+      Alert.alert('Dipindahkan ke Privat', `${targetFiles.length} berkas kini aman di Folder Privat.`);
+    } catch (err) {
+      Alert.alert('Gagal Memindahkan', err instanceof Error ? err.message : 'Terjadi kesalahan.');
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleBatchDeleteCloud = () => {
+    if (!api || selectedCloudItems.length === 0) return;
+    const folderCount = selectedCloudItems.filter((i) => i.kind === 'folder').length;
+    const fileCount = selectedCloudItems.filter((i) => i.kind === 'file').length;
+    const summaryParts = [
+      folderCount > 0 ? `${folderCount} folder (beserta isinya ke Sampah)` : '',
+      fileCount > 0 ? `${fileCount} berkas (ke Sampah 30 hari)` : '',
+    ].filter(Boolean);
+
+    Alert.alert(
+      `Hapus ${selectedCloudItems.length} item?`,
+      `${summaryParts.join(' dan ')} akan dihapus dari Cloud Server.`,
+      [
+        { text: 'Batal', style: 'cancel' },
+        {
+          text: 'Hapus',
+          style: 'destructive',
+          onPress: async () => {
+            const batch = [...selectedCloudItems];
+            exitCloudSelectMode();
+            setBusyAction(`Menghapus ${batch.length} item…`);
+            try {
+              for (const entry of batch) {
+                if (entry.kind === 'folder') {
+                  await api.deleteFolder(entry.folder.id);
+                } else {
+                  await api.trashFile(entry.file.id);
+                }
+              }
+              await Promise.all([refreshAll(), refreshServerInfo(), refreshQueue()]);
+            } catch (err) {
+              Alert.alert('Gagal Menghapus', err instanceof Error ? err.message : 'Terjadi kesalahan.');
+            } finally {
+              setBusyAction(null);
+            }
+          },
+        },
+      ],
+    );
+  };
+
+  const usedBytes = usage?.used_bytes ?? 0;
   const quotaBytes = usage?.quota_bytes ?? 107_374_182_400;
-  const totalCount = usage?.total_files ?? 1248;
 
-  const uploadingCount = queue.filter((i) => i.status === 'uploading').length;
-  const backupStatusKind = backupRules.lastDelayReason
-    ? 'warning'
-    : uploadingCount > 0
-      ? 'uploading'
-      : 'ok';
-  const backupTitle = backupRules.lastDelayReason
-    ? 'Backup tertunda'
-    : uploadingCount > 0
-      ? `Mengunggah ${uploadingCount} berkas`
-      : 'Backup selesai';
-  const backupSubtitle = backupRules.lastDelayReason
-    ? backupRules.lastDelayReason
-    : `${backupRules.lastSuccessAt ? formatShortTime(backupRules.lastSuccessAt) : 'Terbaru'} · ${totalCount.toLocaleString('id-ID')} item`;
+  const sortedFolders = useMemo(
+    () =>
+      sortFileEntries(folders, cloudSort, (f) => ({
+        name: f.name,
+        dateMs: new Date(f.updated_at || f.created_at).getTime() || 0,
+        sizeBytes: f.files_count,
+      })),
+    [cloudSort, folders],
+  );
 
-  const entries: ListEntry[] = [
-    ...folders.map((folder): ListEntry => ({ kind: 'folder', folder })),
-    ...files.map((file): ListEntry => ({ kind: 'file', file })),
-    ...(!folderId && !query.trim() ? [{ kind: 'private-shortcut' as const }] : []),
-  ];
+  const sortedCloudFiles = useMemo(
+    () =>
+      sortFileEntries(files, cloudSort, (f) => ({
+        name: f.name,
+        dateMs: new Date(f.media_taken_at ?? f.created_at).getTime() || 0,
+        sizeBytes: f.size_bytes,
+      })),
+    [cloudSort, files],
+  );
+
+  const cloudEntries = useMemo<ListEntry[]>(() => {
+    if (sourceScope !== 'cloud') return [];
+    return [
+      ...sortedFolders.map((folder): ListEntry => ({ kind: 'folder', folder })),
+      ...sortedCloudFiles.map((file): ListEntry => ({ kind: 'file', file })),
+      ...(!folderId && !query.trim() ? [{ kind: 'private-shortcut' as const }] : []),
+    ];
+  }, [folderId, query, sortedCloudFiles, sortedFolders, sourceScope]);
+
+  const cloudVirtualRows = useMemo<CloudVirtualRow[]>(() => {
+    if (sourceScope !== 'cloud' || cloudEntries.length === 0) return [];
+    if (cloudLayout === 'list') {
+      return cloudEntries.map((entry, index) => ({
+        kind: 'list-entry',
+        key:
+          entry.kind === 'folder'
+            ? `fl-${entry.folder.id}`
+            : entry.kind === 'file'
+              ? `dl-${entry.file.id}`
+              : `pl-${index}`,
+        entry,
+        index,
+        total: cloudEntries.length,
+      }));
+    }
+
+    const rows: CloudVirtualRow[] = [];
+    for (let i = 0; i < cloudEntries.length; i += cloudColumns) {
+      const chunk = cloudEntries.slice(i, i + cloudColumns);
+      const first = chunk[0];
+      const firstId =
+        first.kind === 'folder'
+          ? first.folder.id
+          : first.kind === 'file'
+            ? first.file.id
+            : `priv-${i}`;
+      rows.push({
+        kind: 'grid-row',
+        key: `cg-${firstId}-${i}`,
+        entries: chunk,
+      });
+    }
+    return rows;
+  }, [cloudColumns, cloudEntries, cloudLayout, sourceScope]);
 
   const categoryToRowKind = (cat: DriveFile['category']): FileRowKind => {
     if (cat === 'image' || cat === 'video' || cat === 'audio' || cat === 'archive' || cat === 'document') {
@@ -278,22 +683,31 @@ export default function BerkasScreen() {
     return 'other';
   };
 
+  const handleEndReached = () => {
+    if (sourceScope === 'cloud') {
+      void loadMoreCloudDirectory();
+    } else {
+      setDeviceLoadMoreSignal((n) => n + 1);
+      void loadMoreAllCloudFiles();
+    }
+  };
+
   return (
     <AuroraBackdrop>
       <SafeAreaView style={styles.safe} edges={['top']}>
         <FlatList
-          data={entries}
-          keyExtractor={(item, idx) =>
-            item.kind === 'folder'
-              ? `f-${item.folder.id}`
-              : item.kind === 'file'
-                ? `d-${item.file.id}`
-                : `priv-${idx}`
-          }
+          data={cloudVirtualRows}
+          keyExtractor={(item) => item.key}
+          onEndReached={handleEndReached}
+          onEndReachedThreshold={0.45}
+          initialNumToRender={12}
+          maxToRenderPerBatch={12}
+          windowSize={7}
+          removeClippedSubviews
           refreshControl={
             <RefreshControl
-              refreshing={loading}
-              onRefresh={() => void fetchDirectory()}
+              refreshing={refreshing}
+              onRefresh={() => { setRefreshing(true); void refreshAll().finally(() => setRefreshing(false)); }}
               tintColor={palette.accent}
             />
           }
@@ -302,159 +716,503 @@ export default function BerkasScreen() {
             <View>
               <ScreenHeader
                 title="Berkas"
-                subtitle={`${formatBytes(usedBytes)} dari ${formatBytes(quotaBytes)}`}
+                subtitle={`${formatBytes(usedBytes)} / ${formatBytes(quotaBytes)}`}
               />
 
               <View style={styles.section}>
                 {!api ? (
-                  <Pressable
+                  <ActionPressable
                     onPress={() => router.push('/settings/connect')}
                     accessibilityRole="button"
-                    style={{ marginBottom: 12 }}>
+                    style={{ marginBottom: 10 }}>
                     <Surface solid style={styles.connectBanner}>
                       <View style={{ flex: 1 }}>
                         <AppText weight="bold" size={14}>
-                          Hubungkan Server Pribadi
+                          Masuk ke GunyDrive
                         </AppText>
                         <AppText weight="medium" size={12} color="secondary">
-                          Ketuk untuk memasukkan alamat server &amp; token dari dashboard.
+                          Masuk atau daftar untuk mencadangkan berkas.
                         </AppText>
                       </View>
                       <AppText weight="bold" size={13} color="accent">
-                        Hubungkan
+                        Masuk
                       </AppText>
                     </Surface>
-                  </Pressable>
+                  </ActionPressable>
                 ) : null}
 
                 <SearchField value={query} onChangeText={setQuery} />
 
-                <View style={{ marginTop: 12 }}>
-                  <BackupCard
-                    statusKind={backupStatusKind}
-                    title={backupTitle}
-                    subtitle={backupSubtitle}
-                    usedBytes={usedBytes}
-                    quotaBytes={quotaBytes}
-                    onPress={() => router.push('/(tabs)/backup')}
+                <View style={{ marginTop: 10 }}>
+                  <Segmented
+                    value={sourceScope}
+                    onChange={(next) => {
+                      animateSectionSwitch(
+                        sourceScope === 'device' ? 0 : 1,
+                        next === 'device' ? 0 : 1,
+                      );
+                      startTransition(() => {
+                        setSourceScope(next);
+                      });
+                    }}
+                    options={[
+                      { value: 'device', label: 'Sistem HP' },
+                      { value: 'cloud', label: 'Cloud Server' },
+                    ]}
                   />
                 </View>
 
-                <ScrollView
-                  horizontal
-                  showsHorizontalScrollIndicator={false}
-                  contentContainerStyle={styles.chipsRow}>
-                  {(
-                    [
-                      ['all', 'Semua'],
-                      ['document', 'Dokumen'],
-                      ['media', 'Media'],
-                      ['archive', 'Arsip'],
-                    ] as const
-                  ).map(([key, label]) => (
-                    <Chip
-                      key={key}
-                      label={label}
-                      active={category === key}
-                      onPress={() => setCategory(key)}
+                <Animated.View
+                  style={{
+                    marginTop: 12,
+                    opacity: scopeOpacity,
+                    transform: [{ translateX: scopeTranslateX }],
+                  }}>
+                  {sourceScope === 'device' ? (
+                    <DeviceFileManager
+                      scanCacheRef={scanCacheRef}
+                      allCloudFiles={allCloudFiles}
+                      query={query}
+                      loadMoreSignal={deviceLoadMoreSignal}
+                      loadingMoreCloud={loadingMoreAllCloud}
+                      onRefreshServerFiles={refreshAll}
+                      onOpenCloudFile={(f) => setSelectedFile(f)}
                     />
-                  ))}
-                </ScrollView>
+                  ) : (
+                    <View style={{ gap: 10 }}>
+                      <ScrollView
+                        horizontal
+                        showsHorizontalScrollIndicator={false}
+                        contentContainerStyle={styles.chipsRow}>
+                        {(
+                          [
+                            ['all', 'Semua'],
+                            ['document', 'Dokumen'],
+                            ['media', 'Media'],
+                            ['archive', 'Arsip'],
+                          ] as const
+                        ).map(([key, label], idx, arr) => (
+                          <Chip
+                            key={key}
+                            label={label}
+                            active={category === key}
+                            onPress={() => {
+                              const prevIdx = arr.findIndex(([k]) => k === category);
+                              animateSectionSwitch(prevIdx, idx, 16);
+                              startTransition(() => {
+                                setCategory(key);
+                              });
+                            }}
+                          />
+                        ))}
+                      </ScrollView>
 
-                {breadcrumbs.length > 0 ? (
-                  <Pressable
-                    onPress={() => {
-                      const parent =
-                        breadcrumbs.length >= 2 ? breadcrumbs[breadcrumbs.length - 2].id : null;
-                      setFolderId(parent);
-                    }}
-                    style={styles.backFolder}
-                    accessibilityRole="button">
-                    <ChevronLeft size={18} color={palette.accent} strokeWidth={2.2} />
-                    <AppText weight="semibold" size={14} color="accent">
-                      {breadcrumbs.map((b) => b.name).join(' / ')}
-                    </AppText>
-                  </Pressable>
-                ) : null}
+                      {breadcrumbs.length > 0 ? (
+                        <ActionPressable
+                          onPress={() => {
+                            const parent =
+                              breadcrumbs.length >= 2 ? breadcrumbs[breadcrumbs.length - 2].id : null;
+                            setFolderId(parent);
+                          }}
+                          style={styles.backFolder}
+                          accessibilityRole="button">
+                          <ChevronLeft size={18} color={palette.accent} strokeWidth={2.2} />
+                          <AppText weight="semibold" size={13.5} color="accent">
+                            {breadcrumbs.map((b) => b.name).join(' / ')}
+                          </AppText>
+                        </ActionPressable>
+                      ) : null}
 
-                <View style={styles.sectionHeader}>
-                  <AppText weight="bold" size={15}>
-                    {query.trim() ? 'Hasil pencarian' : folderId ? 'Isi folder' : 'Terbaru'}
-                  </AppText>
-                  <Pressable
-                    onPress={cycleSort}
-                    style={styles.sortBtn}
-                    accessibilityRole="button"
-                    accessibilityLabel={`Urutkan berdasarkan ${sortLabel}`}>
-                    <ArrowUpDown size={15} color={palette.accent} strokeWidth={2} />
-                    <AppText weight="semibold" size={13} color="accent">
-                      {sortLabel}
-                    </AppText>
-                  </Pressable>
-                </View>
+                      <View style={{ marginBottom: 4 }}>
+                        <FileViewToolbar
+                          layout={cloudLayout}
+                          sort={cloudSort}
+                          onChangeLayout={setCloudLayout}
+                          onChangeSort={setCloudSort}
+                          countLabel={`${sortedFolders.length + sortedCloudFiles.length} item`}
+                        />
+                      </View>
+
+                      {/* Cloud Quick Management Strip (Multi-Select & New Folder) */}
+                      <View style={styles.cloudActionStrip}>
+                        <ActionPressable
+                          onPress={() =>
+                            cloudSelectMode ? exitCloudSelectMode() : setCloudSelectMode(true)
+                          }
+                          style={[
+                            styles.cloudMiniPill,
+                            {
+                              backgroundColor: cloudSelectMode ? palette.accent : palette.activeBg,
+                              borderColor: palette.accent,
+                            },
+                          ]}>
+                          <CheckSquare
+                            size={13.5}
+                            color={cloudSelectMode ? palette.onAccent : palette.accent}
+                          />
+                          <AppText
+                            weight="bold"
+                            size={12}
+                            color={cloudSelectMode ? 'onAccent' : 'accent'}>
+                            {cloudSelectMode ? 'Selesai Pilih' : 'Pilih'}
+                          </AppText>
+                        </ActionPressable>
+
+                        <ActionPressable
+                          onPress={() => setNewFolderModal(true)}
+                          style={[
+                            styles.cloudMiniPill,
+                            {
+                              backgroundColor: palette.surface,
+                              borderColor: palette.border,
+                            },
+                          ]}>
+                          <FolderPlus size={13.5} color={palette.accent} />
+                          <AppText weight="bold" size={12} color="primary">
+                            + Folder
+                          </AppText>
+                        </ActionPressable>
+                      </View>
+
+                      {/* Persistent Clipboard Banner (Copy / Cut -> Navigate -> Paste) */}
+                      {clipboard ? (
+                        <Surface solid style={[styles.clipboardCard, { borderColor: palette.accent }]}>
+                          <View style={{ flex: 1 }}>
+                            <AppText weight="extrabold" size={13}>
+                              {clipboard.mode === 'copy' ? 'Salin' : 'Pindahkan'}{' '}
+                              {clipboard.items.length} item
+                            </AppText>
+                            <AppText size={11.5} color="secondary" numberOfLines={1}>
+                              Buka folder tujuan lalu tekan Tempel di sini
+                            </AppText>
+                          </View>
+                          <ActionPressable
+                            onPress={() => void handlePasteClipboard()}
+                            style={[styles.pasteBtn, { backgroundColor: palette.accent }]}>
+                            <ClipboardPaste size={14} color={palette.onAccent} />
+                            <AppText weight="bold" size={12} color="onAccent">
+                              Tempel
+                            </AppText>
+                          </ActionPressable>
+                          <ActionPressable
+                            onPress={() => setClipboard(null)}
+                            hitSlop={8}
+                            style={[styles.miniCloseBtn, { backgroundColor: palette.background }]}>
+                            <X size={15} color={palette.textSecondary} />
+                          </ActionPressable>
+                        </Surface>
+                      ) : null}
+
+                      {/* Cloud Multi-Select Action Bar */}
+                      {cloudSelectMode ? (
+                        <Surface solid style={[styles.cloudSelectCard, { borderColor: palette.accent }]}>
+                          <View style={styles.cloudSelectTop}>
+                            <AppText weight="extrabold" size={13} style={{ flex: 1 }}>
+                              {selectedCloudItems.length} item dipilih
+                            </AppText>
+                            <ActionPressable
+                              onPress={handleToggleSelectAllCloud}
+                              style={[styles.smallSelectBtn, { backgroundColor: palette.activeBg }]}>
+                              <Check size={12.5} color={palette.accent} />
+                              <AppText weight="bold" size={11} color="accent">
+                                Pilih Semua
+                              </AppText>
+                            </ActionPressable>
+                            <ActionPressable
+                              onPress={exitCloudSelectMode}
+                              hitSlop={8}
+                              style={[styles.miniCloseBtn, { backgroundColor: palette.background }]}>
+                              <X size={15} color={palette.textSecondary} />
+                            </ActionPressable>
+                          </View>
+
+                          <ScrollView
+                            horizontal
+                            showsHorizontalScrollIndicator={false}
+                            contentContainerStyle={styles.cloudSelectActions}>
+                            <ActionPressable
+                              disabled={selectedCloudItems.length === 0}
+                              onPress={() => handleStartClipboard('copy', selectedCloudItems)}
+                              style={[
+                                styles.cloudOpBtn,
+                                {
+                                  backgroundColor:
+                                    selectedCloudItems.length > 0 ? palette.activeBg : palette.background,
+                                },
+                              ]}>
+                              <Copy size={14} color={palette.accent} />
+                              <AppText weight="bold" size={12} color="accent">
+                                Salin
+                              </AppText>
+                            </ActionPressable>
+
+                            <ActionPressable
+                              disabled={selectedCloudItems.length === 0}
+                              onPress={() => handleStartClipboard('cut', selectedCloudItems)}
+                              style={[
+                                styles.cloudOpBtn,
+                                {
+                                  backgroundColor:
+                                    selectedCloudItems.length > 0 ? palette.activeBg : palette.background,
+                                },
+                              ]}>
+                              <Scissors size={14} color={palette.accent} />
+                              <AppText weight="bold" size={12} color="accent">
+                                Potong
+                              </AppText>
+                            </ActionPressable>
+
+                            {selectedCloudItems.length === 1 ? (
+                              <ActionPressable
+                                onPress={() => handleOpenRename(selectedCloudItems[0])}
+                                style={[styles.cloudOpBtn, { backgroundColor: palette.activeBg }]}>
+                                <Edit3 size={14} color={palette.accent} />
+                                <AppText weight="bold" size={12} color="accent">
+                                  Ubah Nama
+                                </AppText>
+                              </ActionPressable>
+                            ) : null}
+
+                            {selectedCloudItems.some((it) => it.kind === 'file') ? (
+                              <ActionPressable
+                                onPress={() => void handleBatchMoveToPrivate()}
+                                style={[styles.cloudOpBtn, { backgroundColor: palette.activeBg }]}>
+                                <Lock size={14} color={palette.accent} />
+                                <AppText weight="bold" size={12} color="accent">
+                                  Ke Privat
+                                </AppText>
+                              </ActionPressable>
+                            ) : null}
+
+                            <ActionPressable
+                              disabled={selectedCloudItems.length === 0}
+                              onPress={handleBatchDeleteCloud}
+                              style={[
+                                styles.cloudOpBtn,
+                                {
+                                  backgroundColor:
+                                    selectedCloudItems.length > 0
+                                      ? `${palette.danger}1C`
+                                      : palette.background,
+                                },
+                              ]}>
+                              <Trash2 size={14} color={palette.danger} />
+                              <AppText weight="bold" size={12} color="danger">
+                                Hapus
+                              </AppText>
+                            </ActionPressable>
+                          </ScrollView>
+                        </Surface>
+                      ) : null}
+                    </View>
+                  )}
+                </Animated.View>
               </View>
             </View>
           }
-          renderItem={({ item, index }) => (
-            <View style={styles.cardRowContainer}>
-              <Surface
-                style={[
-                  index === 0 && styles.firstCard,
-                  index === entries.length - 1 && styles.lastCard,
-                  index > 0 && styles.middleCard,
-                  index < entries.length - 1 && styles.notLastCard,
-                ]}>
-                {item.kind === 'folder' ? (
-                  <FileRow
-                    kind="folder"
-                    title={item.folder.name}
-                    subtitle={`Folder · ${item.folder.files_count} berkas`}
-                    showDivider={index > 0}
-                    onPress={() => {
-                      if (!api) {
-                        Alert.alert('Data contoh', 'Hubungkan server untuk menelusuri isi folder nyata.');
-                        return;
-                      }
-                      setFolderId(item.folder.id);
-                    }}
-                  />
-                ) : item.kind === 'file' ? (
-                  <FileRow
-                    kind={categoryToRowKind(item.file.category)}
-                    title={item.file.name}
-                    subtitle={`${item.file.mime_type.split('/').pop()?.toUpperCase() || 'BERKAS'} · ${formatBytes(item.file.size_bytes)} · ${formatShortTime(item.file.created_at)}`}
-                    showDivider={index > 0}
-                    onPress={() => setSelectedFile(item.file)}
-                  />
-                ) : (
-                  <FileRow
-                    kind="private"
-                    title="Folder Privat"
-                    subtitle={vaultToken ? 'Terbuka sementara' : 'Terkunci'}
-                    showDivider={index > 0}
-                    onPress={() => router.push('/(tabs)/privat')}
-                  />
-                )}
-              </Surface>
-            </View>
-          )}
+          renderItem={({ item }) => {
+            if (item.kind === 'list-entry') {
+              const { entry, index, total } = item;
+              return (
+                <View style={styles.cardRowContainer}>
+                  <Surface
+                    style={[
+                      index === 0 && total > 1 && styles.firstCard,
+                      index === total - 1 && total > 1 && styles.lastCard,
+                      index > 0 && index < total - 1 && styles.middleCard,
+                    ]}>
+                    {entry.kind === 'folder' ? (
+                      <FileRow
+                        kind="folder"
+                        title={entry.folder.name}
+                        subtitle={`Folder · ${entry.folder.files_count} berkas`}
+                        showDivider={index > 0}
+                        selectable={cloudSelectMode}
+                        selected={cloudSelectedKeys.has(entryKey({ kind: 'folder', folder: entry.folder }))}
+                        onPress={() => {
+                          if (cloudSelectMode) {
+                            toggleCloudSelect({ kind: 'folder', folder: entry.folder });
+                            return;
+                          }
+                          startTransition(() => setFolderId(entry.folder.id));
+                        }}
+                        onLongPress={() => toggleCloudSelect({ kind: 'folder', folder: entry.folder })}
+                      />
+                    ) : entry.kind === 'file' ? (
+                      <FileRow
+                        kind={categoryToRowKind(entry.file.category)}
+                        title={entry.file.name}
+                        subtitle={`${entry.file.mime_type.split('/').pop()?.toUpperCase() || 'BERKAS'} · ${formatBytes(entry.file.size_bytes)} · ${formatShortTime(entry.file.created_at)}`}
+                        mimeType={entry.file.mime_type}
+                        thumbnailPreset={entry.file.thumbnail_preset}
+                        thumbnailSource={getDriveFileThumbnailSource(api, entry.file)}
+                        showDivider={index > 0}
+                        selectable={cloudSelectMode}
+                        selected={cloudSelectedKeys.has(entryKey({ kind: 'file', file: entry.file }))}
+                        onPress={() => {
+                          if (cloudSelectMode) {
+                            toggleCloudSelect({ kind: 'file', file: entry.file });
+                            return;
+                          }
+                          setSelectedFile(entry.file);
+                        }}
+                        onLongPress={() => toggleCloudSelect({ kind: 'file', file: entry.file })}
+                      />
+                    ) : (
+                      <FileRow
+                        kind="private"
+                        title="Folder Privat"
+                        subtitle={vaultToken ? 'Terbuka sementara' : 'Terkunci'}
+                        showDivider={index > 0}
+                        onPress={() => router.push('/(tabs)/privat')}
+                      />
+                    )}
+                  </Surface>
+                </View>
+              );
+            }
+
+            return (
+              <View style={[styles.cardRowContainer, { marginBottom: cloudGridGap }]}>
+                <View style={[styles.cloudGridRow, { gap: cloudGridGap }]}>
+                  {item.entries.map((entry, idx) => {
+                    if (entry.kind === 'file') {
+                      const fileItem: CloudClipboardItem = { kind: 'file', file: entry.file };
+                      return (
+                        <DriveFileGridTile
+                          key={`cg-${entry.file.id}`}
+                          file={entry.file}
+                          api={api}
+                          size={cloudTileSize}
+                          layout={cloudLayout}
+                          selectable={cloudSelectMode}
+                          selected={cloudSelectedKeys.has(entryKey(fileItem))}
+                          onPress={() => {
+                            if (cloudSelectMode) {
+                              toggleCloudSelect(fileItem);
+                              return;
+                            }
+                            setSelectedFile(entry.file);
+                          }}
+                          onLongPress={() => toggleCloudSelect(fileItem)}
+                        />
+                      );
+                    }
+                    const isPrivate = entry.kind === 'private-shortcut';
+                    const folderItem = !isPrivate ? ({ kind: 'folder', folder: entry.folder } as const) : null;
+                    const isFolderSelected = folderItem
+                      ? cloudSelectedKeys.has(entryKey(folderItem))
+                      : false;
+                    const title = isPrivate ? 'Folder Privat' : entry.folder.name;
+                    const sub = isPrivate
+                      ? vaultToken
+                        ? 'Terbuka'
+                        : 'Terkunci'
+                      : `${entry.folder.files_count} berkas`;
+                    const dense = cloudLayout === 'grid4';
+                    return (
+                      <ActionPressable
+                        key={isPrivate ? `priv-${idx}` : `fg-${entry.folder.id}`}
+                        onPress={() => {
+                          if (isPrivate) {
+                            router.push('/(tabs)/privat');
+                            return;
+                          }
+                          if (cloudSelectMode && folderItem) {
+                            toggleCloudSelect(folderItem);
+                            return;
+                          }
+                          startTransition(() => setFolderId(entry.folder.id));
+                        }}
+                        onLongPress={() => {
+                          if (folderItem) toggleCloudSelect(folderItem);
+                        }}
+                        style={[
+                          styles.cloudFolderTile,
+                          {
+                            width: cloudTileSize,
+                            height: cloudTileSize,
+                            borderRadius: cloudLayout === 'grid2' ? 14 : dense ? 8 : 12,
+                            backgroundColor: isFolderSelected ? palette.activeBg : palette.surface,
+                            borderColor: isFolderSelected ? palette.accent : palette.border,
+                            borderWidth: isFolderSelected ? 2 : 1,
+                          },
+                        ]}
+                        accessibilityRole="button"
+                        accessibilityLabel={title}>
+                        {cloudSelectMode && !isPrivate ? (
+                          <View
+                            style={[
+                              styles.folderSelectDot,
+                              {
+                                backgroundColor: isFolderSelected ? palette.accent : 'rgba(8,11,26,0.35)',
+                                borderColor: isFolderSelected ? palette.accent : palette.border,
+                              },
+                            ]}>
+                            {isFolderSelected ? (
+                              <Check size={11} color={palette.onAccent} strokeWidth={3} />
+                            ) : null}
+                          </View>
+                        ) : null}
+                        <View
+                          style={[
+                            styles.cloudFolderIconWrap,
+                            {
+                              backgroundColor: palette.activeBg,
+                              width: dense ? 32 : 42,
+                              height: dense ? 32 : 42,
+                              borderRadius: dense ? 10 : 13,
+                            },
+                          ]}>
+                          {isPrivate ? (
+                            <Lock size={dense ? 16 : 20} color={palette.accent} strokeWidth={2} />
+                          ) : (
+                            <FolderIcon size={dense ? 16 : 20} color={palette.accent} strokeWidth={2} />
+                          )}
+                        </View>
+                        <AppText
+                          weight="bold"
+                          size={dense ? 10 : 12}
+                          numberOfLines={1}
+                          style={{ textAlign: 'center', paddingHorizontal: 4 }}>
+                          {title}
+                        </AppText>
+                        {!dense ? (
+                          <AppText weight="medium" size={10.5} color="secondary" numberOfLines={1}>
+                            {sub}
+                          </AppText>
+                        ) : null}
+                      </ActionPressable>
+                    );
+                  })}
+                </View>
+              </View>
+            );
+          }}
           ListEmptyComponent={
-            <View style={styles.section}>
-              <Surface style={styles.emptyBox}>
-                <AppText weight="semibold" size={14}>
-                  Belum ada berkas di sini
-                </AppText>
-                <AppText weight="medium" size={12.5} color="secondary" style={{ marginTop: 4 }}>
-                  Ketuk tombol + Tambah untuk mengunggah berkas atau membuat folder baru.
-                </AppText>
-              </Surface>
-            </View>
+            sourceScope === 'device' ? undefined : loading ? <FileSkeleton layout={cloudLayout} /> : (
+              <View style={styles.section}>
+                <Surface style={styles.emptyBox}>
+                  <AppText weight="semibold" size={14}>
+                    Belum ada berkas di sini
+                  </AppText>
+                  <AppText weight="medium" size={12.5} color="secondary" style={{ marginTop: 4 }}>
+                    Ketuk tombol + Tambah untuk mengunggah berkas atau membuat folder baru.
+                  </AppText>
+                </Surface>
+              </View>
+            )
+          }
+          ListFooterComponent={
+            sourceScope === 'cloud' && loadingMoreCloud ? (
+              <FileSkeleton compact layout={cloudLayout} />
+            ) : undefined
           }
         />
 
         <FabButton label="Tambah" onPress={() => setAddSheetOpen(true)} />
 
-        {/* Add action sheet */}
+        {/* Unified Add Sheet (Zero Double Storage!) */}
         <Modal
           visible={addSheetOpen}
           transparent
@@ -462,36 +1220,52 @@ export default function BerkasScreen() {
           onRequestClose={() => setAddSheetOpen(false)}>
           <Pressable style={styles.backdrop} onPress={() => setAddSheetOpen(false)}>
             <Surface solid style={styles.sheet}>
-              <AppText weight="bold" size={17} style={{ marginBottom: 12 }}>
-                Tambah ke {folderId ? 'folder ini' : 'GunyDrive'}
+              <AppText weight="bold" size={17} style={{ marginBottom: 10 }}>
+                Tambah ke {sourceScope === 'cloud' && folderId ? 'folder ini' : 'GunyDrive'}
               </AppText>
-              <Pressable onPress={() => void handleUploadManual()} style={styles.sheetItem}>
+              <ActionPressable onPress={() => void handleUploadDirect()} style={styles.sheetItem}>
                 <Upload size={20} color={palette.accent} strokeWidth={2} />
                 <View style={{ flex: 1 }}>
                   <AppText weight="bold" size={15}>
-                    Unggah berkas
+                    Unggah &amp; Backup Berkas
                   </AppText>
-                  <AppText size={12.5} color="secondary">
-                    Pilih PDF, foto, video, audio, ZIP, atau format lain
-                  </AppText>
-                </View>
-              </Pressable>
-              <Pressable
-                onPress={() => {
-                  setAddSheetOpen(false);
-                  setNewFolderModal(true);
-                }}
-                style={[styles.sheetItem, { borderTopWidth: 1, borderTopColor: palette.divider }]}>
-                <FolderPlus size={20} color={palette.accent} strokeWidth={2} />
-                <View style={{ flex: 1 }}>
-                  <AppText weight="bold" size={15}>
-                    Buat folder baru
-                  </AppText>
-                  <AppText size={12.5} color="secondary">
-                    Kelompokkan berkas dalam ruang biasa
+                  <AppText size={12} color="secondary">
+                    Langsung unggah ke Cloud tanpa menyalin ganda di penyimpanan HP
                   </AppText>
                 </View>
-              </Pressable>
+              </ActionPressable>
+              {sourceScope === 'cloud' ? (
+                <ActionPressable
+                  onPress={() => {
+                    setAddSheetOpen(false);
+                    setNewFolderModal(true);
+                  }}
+                  style={[styles.sheetItem, { borderTopWidth: 1, borderTopColor: palette.divider }]}>
+                  <FolderPlus size={20} color={palette.accent} strokeWidth={2} />
+                  <View style={{ flex: 1 }}>
+                    <AppText weight="bold" size={15}>
+                      Buat Folder Baru
+                    </AppText>
+                    <AppText size={12} color="secondary">
+                      Kelompokkan berkas pada Cloud Server
+                    </AppText>
+                  </View>
+                </ActionPressable>
+              ) : (
+                <ActionPressable
+                  onPress={() => void handleConnectFolder()}
+                  style={[styles.sheetItem, { borderTopWidth: 1, borderTopColor: palette.divider }]}>
+                  <FolderOpen size={20} color={palette.accent} strokeWidth={2} />
+                  <View style={{ flex: 1 }}>
+                    <AppText weight="bold" size={15}>
+                      Hubungkan Folder HP
+                    </AppText>
+                    <AppText size={12} color="secondary">
+                      Pindai DCIM, Pictures, Download, Documents, atau Music untuk backup otomatis
+                    </AppText>
+                  </View>
+                </ActionPressable>
+              )}
             </Surface>
           </Pressable>
         </Modal>
@@ -523,75 +1297,84 @@ export default function BerkasScreen() {
                 ]}
               />
               <View style={styles.modalActions}>
-                <Pressable onPress={() => setNewFolderModal(false)} style={styles.btnGhost}>
+                <ActionPressable onPress={() => setNewFolderModal(false)} style={styles.btnGhost}>
                   <AppText weight="semibold" color="secondary">
                     Batal
                   </AppText>
-                </Pressable>
-                <Pressable
+                </ActionPressable>
+                <ActionPressable
                   onPress={() => void handleCreateFolder()}
                   style={[styles.btnPrimary, { backgroundColor: palette.accent }]}>
                   <AppText weight="bold" color="onAccent">
                     Buat
                   </AppText>
-                </Pressable>
+                </ActionPressable>
               </View>
             </Surface>
           </Pressable>
         </Modal>
 
-        {/* File detail / action modal */}
+        {/* Rename File / Folder Modal */}
         <Modal
-          visible={selectedFile !== null}
+          visible={renameTarget !== null}
           transparent
           animationType="fade"
-          onRequestClose={() => setSelectedFile(null)}>
-          <Pressable style={styles.backdrop} onPress={() => setSelectedFile(null)}>
-            {selectedFile ? (
+          onRequestClose={() => setRenameTarget(null)}>
+          <Pressable style={styles.backdrop} onPress={() => setRenameTarget(null)}>
+            <Pressable onPress={(e) => e.stopPropagation()} style={{ width: '100%' }}>
               <Surface solid style={styles.sheet}>
-                <AppText weight="bold" size={17} numberOfLines={2}>
-                  {selectedFile.name}
+                <AppText weight="bold" size={17}>
+                  Ubah Nama {renameTarget?.kind === 'folder' ? 'Folder' : 'Berkas'}
                 </AppText>
-                <AppText size={12.5} color="secondary" tabular style={{ marginTop: 4, marginBottom: 14 }}>
-                  {selectedFile.mime_type} · {formatBytes(selectedFile.size_bytes)} · SHA-256:{' '}
-                  {selectedFile.sha256.slice(0, 12)}…
-                </AppText>
-
-                <Pressable onPress={() => void handleDownloadFile(selectedFile)} style={styles.sheetItem}>
-                  <Download size={19} color={palette.accent} strokeWidth={2} />
-                  <AppText weight="bold" size={15}>
-                    Unduh salinan asli (verifikasi SHA-256)
-                  </AppText>
-                </Pressable>
-
-                <Pressable
-                  onPress={() => void handleMoveToPrivate(selectedFile)}
-                  style={[styles.sheetItem, { borderTopWidth: 1, borderTopColor: palette.divider }]}>
-                  <Lock size={19} color={palette.accent} strokeWidth={2} />
-                  <AppText weight="bold" size={15}>
-                    Pindahkan ke Folder Privat
-                  </AppText>
-                </Pressable>
-
-                <Pressable
-                  onPress={() => void handleTrashFile(selectedFile)}
-                  style={[styles.sheetItem, { borderTopWidth: 1, borderTopColor: palette.divider }]}>
-                  <Trash2 size={19} color={palette.danger} strokeWidth={2} />
-                  <AppText weight="bold" size={15} color="danger">
-                    Pindahkan ke Sampah
-                  </AppText>
-                </Pressable>
+                <TextInput
+                  value={renameInput}
+                  onChangeText={setRenameInput}
+                  placeholder="Masukkan nama baru"
+                  placeholderTextColor={palette.textSecondary}
+                  autoFocus
+                  style={[
+                    styles.modalInput,
+                    {
+                      borderColor: palette.border,
+                      color: palette.text,
+                      fontFamily: FontFamily.medium,
+                    },
+                  ]}
+                />
+                <View style={styles.modalActions}>
+                  <ActionPressable onPress={() => setRenameTarget(null)} style={styles.btnGhost}>
+                    <AppText weight="semibold" color="secondary">
+                      Batal
+                    </AppText>
+                  </ActionPressable>
+                  <ActionPressable
+                    onPress={() => void handleConfirmRename()}
+                    style={[styles.btnPrimary, { backgroundColor: palette.accent }]}>
+                    <AppText weight="bold" color="onAccent">
+                      Simpan
+                    </AppText>
+                  </ActionPressable>
+                </View>
               </Surface>
-            ) : null}
+            </Pressable>
           </Pressable>
         </Modal>
 
-        {/* Progress overlay */}
+        {/* Online File Viewer & Reader Modal */}
+        <OnlineFileViewerModal
+          file={selectedFile}
+          api={api}
+          onClose={() => setSelectedFile(null)}
+          onDownload={(f) => handleDownloadFile(f)}
+          onMoveToPrivate={(f) => handleMoveToPrivate(f)}
+          onTrash={(f) => handleTrashFile(f)}
+        />
+
         {busyAction ? (
           <View style={styles.busyOverlay}>
             <Surface solid style={styles.busyCard}>
               <ActivityIndicator color={palette.accent} />
-              <AppText weight="semibold" size={14} style={{ marginTop: 10 }}>
+              <AppText weight="semibold" size={14} style={{ marginTop: 10, textAlign: 'center' }}>
                 {busyAction}
               </AppText>
             </Surface>
@@ -613,26 +1396,9 @@ const styles = StyleSheet.create({
     padding: 14,
   },
   chipsRow: {
-    gap: 8,
-    paddingTop: 14,
-    paddingBottom: 2,
+    gap: 7,
   },
   backFolder: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-    marginTop: 12,
-    minHeight: 36,
-  },
-  sectionHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    marginTop: 16,
-    marginBottom: 8,
-    paddingHorizontal: 2,
-  },
-  sortBtn: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 4,
@@ -641,28 +1407,125 @@ const styles = StyleSheet.create({
   cardRowContainer: {
     paddingHorizontal: Spacing.screen,
   },
+  cloudGridRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+  },
+  cloudFolderTile: {
+    position: 'relative',
+    borderWidth: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 5,
+    padding: 8,
+  },
+  folderSelectDot: {
+    position: 'absolute',
+    top: 6,
+    left: 6,
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    borderWidth: 1.5,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  cloudActionStrip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  cloudMiniPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    paddingHorizontal: 11,
+    paddingVertical: 7,
+    borderRadius: 999,
+    borderWidth: 1,
+  },
+  clipboardCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    padding: 12,
+    borderRadius: 16,
+    borderWidth: 1.2,
+  },
+  pasteBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 999,
+  },
+  miniCloseBtn: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  cloudSelectCard: {
+    padding: 12,
+    borderRadius: 18,
+    borderWidth: 1.2,
+    gap: 10,
+  },
+  cloudSelectTop: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  smallSelectBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+  },
+  cloudSelectActions: {
+    gap: 7,
+  },
+  cloudOpBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 999,
+  },
+  cloudFolderIconWrap: {
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   firstCard: {
     borderBottomLeftRadius: 0,
     borderBottomRightRadius: 0,
     borderBottomWidth: 0,
   },
   middleCard: {
-    borderTopLeftRadius: 0,
-    borderTopRightRadius: 0,
+    borderRadius: 0,
     borderTopWidth: 0,
-  },
-  notLastCard: {
-    borderBottomLeftRadius: 0,
-    borderBottomRightRadius: 0,
     borderBottomWidth: 0,
   },
   lastCard: {
     borderTopLeftRadius: 0,
     borderTopRightRadius: 0,
+    borderTopWidth: 0,
   },
   emptyBox: {
     padding: 24,
     alignItems: 'center',
+  },
+  loadMoreFooter: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    paddingVertical: 18,
   },
   backdrop: {
     flex: 1,
@@ -677,8 +1540,8 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 14,
-    paddingVertical: 14,
-    minHeight: 52,
+    paddingVertical: 13,
+    minHeight: 50,
   },
   modalInput: {
     height: 46,

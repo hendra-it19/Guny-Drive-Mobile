@@ -1,5 +1,6 @@
+import { ActionPressable } from '@/components/ui/ActionPressable';
 import React from 'react';
-import { Pressable, StyleSheet, View } from 'react-native';
+import { StyleSheet, View } from 'react-native';
 
 import { useAppTheme } from '@/context/theme-context';
 
@@ -13,7 +14,7 @@ export function Toggle({ value, onValueChange, accessibilityLabel }: Props) {
   const { palette } = useAppTheme();
 
   return (
-    <Pressable
+    <ActionPressable
       onPress={() => onValueChange(!value)}
       accessibilityRole="switch"
       accessibilityLabel={accessibilityLabel}
@@ -36,7 +37,7 @@ export function Toggle({ value, onValueChange, accessibilityLabel }: Props) {
           },
         ]}
       />
-    </Pressable>
+    </ActionPressable>
   );
 }
 

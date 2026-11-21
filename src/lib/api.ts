@@ -1,7 +1,45 @@
+import Constants from 'expo-constants';
 import { Directory, File, Paths } from 'expo-file-system';
 import { Platform } from 'react-native';
 
-import { StoredCredentials } from './credentials';
+import type { StoredCredentials } from './credentials';
+
+// Set the HTTPS origin of your Laravel installation here for a release build (e.g. 'https://domainsaya.com').
+const DEPLOYED_SERVER_URL = '';
+
+function normalizeServerOrigin(raw: string): string {
+  const trimmed = raw.trim().replace(/\/+$/, '');
+  if (!trimmed) return '';
+  if (!/^https?:\/\//i.test(trimmed)) {
+    return `https://${trimmed}`;
+  }
+  return trimmed;
+}
+
+function detectDevelopmentServerUrl(): string {
+  const hostUri = Constants.expoConfig?.hostUri;
+  const metroHost = hostUri?.split(':')[0]?.trim();
+  if (metroHost && metroHost !== 'localhost' && metroHost !== '127.0.0.1') {
+    return `http://${metroHost}:8000`;
+  }
+  return Platform.OS === 'android' ? 'http://10.0.2.2:8000' : 'http://localhost:8000';
+}
+
+const developmentUrl = detectDevelopmentServerUrl();
+export const SERVER_URL = normalizeServerOrigin(
+  process.env.EXPO_PUBLIC_SERVER_URL ??
+    (DEPLOYED_SERVER_URL || (__DEV__ ? developmentUrl : '')),
+);
+
+export function configuredServer(): string {
+  if (!SERVER_URL) throw new Error('Alamat backend belum dikonfigurasi pada build aplikasi.');
+  const url = new URL(SERVER_URL);
+  const localDevelopment = __DEV__ && url.protocol === 'http:';
+  if ((!localDevelopment && url.protocol !== 'https:') || url.username || url.password || url.search || url.hash) {
+    throw new Error('Konfigurasi backend memerlukan alamat HTTPS yang valid.');
+  }
+  return SERVER_URL;
+}
 
 export type DriveFolder = {
   id: string;
@@ -12,6 +50,19 @@ export type DriveFolder = {
   created_at: string;
   updated_at: string;
 };
+
+export type ThumbnailPresetKey =
+  | 'pdf'
+  | 'word'
+  | 'excel'
+  | 'powerpoint'
+  | 'text'
+  | 'code'
+  | 'audio'
+  | 'archive'
+  | 'video'
+  | 'image'
+  | 'file';
 
 export type DriveFile = {
   id: string;
@@ -24,6 +75,12 @@ export type DriveFile = {
   category: 'image' | 'video' | 'document' | 'audio' | 'archive' | 'other';
   has_preview: boolean;
   has_thumbnail: boolean;
+  has_custom_thumbnail?: boolean;
+  thumbnail_preset?: ThumbnailPresetKey;
+  thumbnail_status?: string;
+  thumbnail_mime?: string | null;
+  thumbnail_size_bytes?: number | null;
+  default_thumbnail_url?: string;
   media_taken_at: string | null;
   status: string;
   deleted_at: string | null;
@@ -46,8 +103,15 @@ export type UsageSummary = {
 };
 
 export type MeResponse = {
-  server: { name: string; api_version: string; time_utc: string };
-  owner: { id: number; name: string; email: string };
+  server: { storage_link_ready?: boolean; name: string; api_version: string; time_utc: string };
+  owner: {
+    id: number;
+    name: string;
+    email: string;
+    username?: string | null;
+    avatar_url?: string | null;
+    passkey_enabled?: boolean;
+  };
   device: { id: string; name: string; platform: string | null; last_backup_at: string | null } | null;
   vault_configured: boolean;
   usage: UsageSummary;
@@ -106,12 +170,20 @@ export class GunyDriveApi {
     return headers;
   }
 
-  thumbnailUrl(fileId: string): string {
-    return `${this.creds.serverUrl}/api/v1/files/${fileId}/thumbnail`;
+  thumbnailUrl(fileId: string, includeTrashed = false): string {
+    return `${this.creds.serverUrl}/api/v1/files/${fileId}/thumbnail${includeTrashed ? '?include_trashed=1' : ''}`;
   }
 
-  contentUrl(fileId: string, inline = false): string {
-    return `${this.creds.serverUrl}/api/v1/files/${fileId}/content${inline ? '?inline=1' : ''}`;
+  defaultThumbnailUrl(preset: ThumbnailPresetKey): string {
+    return `${this.creds.serverUrl}/api/v1/thumbnails/defaults/${preset}.svg`;
+  }
+
+  contentUrl(fileId: string, inline = false, includeTrashed = false): string {
+    const qs = new URLSearchParams();
+    if (inline) qs.set('inline', '1');
+    if (includeTrashed) qs.set('include_trashed', '1');
+    const suffix = qs.toString() ? `?${qs.toString()}` : '';
+    return `${this.creds.serverUrl}/api/v1/files/${fileId}/content${suffix}`;
   }
 
   private async request<T>(
@@ -167,6 +239,7 @@ export class GunyDriveApi {
     category?: string;
     sort?: 'date' | 'name' | 'size';
     cursor?: string | null;
+    perPage?: number;
   }): Promise<DirectoryResponse> {
     const qs = new URLSearchParams();
     if (params.folderId) qs.set('folder_id', params.folderId);
@@ -174,6 +247,7 @@ export class GunyDriveApi {
     if (params.category && params.category !== 'all') qs.set('category', params.category);
     if (params.sort) qs.set('sort', params.sort);
     if (params.cursor) qs.set('cursor', params.cursor);
+    if (params.perPage) qs.set('per_page', String(params.perPage));
     const suffix = qs.toString() ? `?${qs.toString()}` : '';
     return this.request<DirectoryResponse>(`/files${suffix}`);
   }
@@ -186,6 +260,29 @@ export class GunyDriveApi {
     });
   }
 
+  updateFolder(
+    folderId: string,
+    patch: { name?: string; parent_id?: string | null },
+  ): Promise<{ folder: DriveFolder }> {
+    return this.request(`/folders/${folderId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
+  }
+
+  copyFolder(folderId: string, parentId: string | null): Promise<{ folder: DriveFolder }> {
+    return this.request(`/folders/${folderId}/copy`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ parent_id: parentId }),
+    });
+  }
+
+  deleteFolder(folderId: string): Promise<{ deleted: boolean }> {
+    return this.request(`/folders/${folderId}`, { method: 'DELETE' });
+  }
+
   updateFile(fileId: string, patch: { name?: string; folder_id?: string | null }): Promise<{ file: DriveFile }> {
     return this.request(`/files/${fileId}`, {
       method: 'PATCH',
@@ -194,22 +291,48 @@ export class GunyDriveApi {
     });
   }
 
+  copyFile(fileId: string, folderId: string | null): Promise<{ file: DriveFile }> {
+    return this.request(`/files/${fileId}/copy`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ folder_id: folderId }),
+    });
+  }
+
   trashFile(fileId: string): Promise<{ file: DriveFile }> {
     return this.request(`/files/${fileId}`, { method: 'DELETE' });
   }
 
-  listMedia(type: 'all' | 'image' | 'video' = 'all', cursor?: string | null): Promise<{
+  listMedia(
+    type: 'all' | 'everything' | 'image' | 'video' | 'document' = 'all',
+    cursor?: string | null,
+    perPage = 24,
+  ): Promise<{
     items: DriveFile[];
     total_count: number;
+    counts?: {
+      everything: number;
+      image: number;
+      video: number;
+      document: number;
+    };
     next_cursor: string | null;
   }> {
-    const qs = new URLSearchParams({ type });
+    const qs = new URLSearchParams({ type, per_page: String(perPage) });
     if (cursor) qs.set('cursor', cursor);
     return this.request(`/media?${qs.toString()}`);
   }
 
   listTrash(): Promise<{ files: DriveFile[] }> {
     return this.request('/trash');
+  }
+
+  emptyTrash(): Promise<{ purged_count: number }> {
+    return this.request('/trash', { method: 'DELETE' });
+  }
+
+  restoreAllTrash(): Promise<{ restored_count: number }> {
+    return this.request('/trash/restore-all', { method: 'POST' });
   }
 
   restoreTrash(fileId: string): Promise<{ file: DriveFile }> {
@@ -233,6 +356,7 @@ export class GunyDriveApi {
       source_asset_id?: string | null;
       source_revision?: string | null;
       auto_backup?: boolean;
+      deduplicate?: boolean;
     },
     vaultToken?: string | null,
   ): Promise<{ upload?: UploadSessionResponse; file?: DriveFile; skipped?: boolean; reason?: string }> {
@@ -282,6 +406,22 @@ export class GunyDriveApi {
     return this.request(`/uploads/${uploadId}`, { method: 'DELETE' }, vaultToken);
   }
 
+  setupVault(
+    pin: string,
+    pinConfirmation: string,
+  ): Promise<{
+    configured: boolean;
+    vault_token: string;
+    expires_at: string;
+    idle_timeout_seconds: number;
+  }> {
+    return this.request('/vault/setup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pin, pin_confirmation: pinConfirmation }),
+    });
+  }
+
   unlockVault(passphrase: string): Promise<{
     vault_token: string;
     expires_at: string;
@@ -294,17 +434,37 @@ export class GunyDriveApi {
     });
   }
 
+  enrollPasskey(): Promise<{
+    passkey_token: string;
+    username?: string | null;
+    email: string;
+    message: string;
+  }> {
+    return this.request('/auth/passkey/enroll', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  disablePasskey(): Promise<{ enabled: boolean; message: string }> {
+    return this.request('/auth/passkey', {
+      method: 'DELETE',
+    });
+  }
+
   lockVault(vaultToken: string): Promise<{ locked: boolean }> {
     return this.request('/vault/session', { method: 'DELETE' }, vaultToken);
   }
 
   listVaultFiles(
     vaultToken: string,
-    params: { folderId?: string | null; q?: string } = {},
+    params: { folderId?: string | null; q?: string; cursor?: string | null; perPage?: number } = {},
   ): Promise<DirectoryResponse> {
     const qs = new URLSearchParams();
     if (params.folderId) qs.set('folder_id', params.folderId);
     if (params.q) qs.set('q', params.q);
+    if (params.cursor) qs.set('cursor', params.cursor);
+    if (params.perPage) qs.set('per_page', String(params.perPage));
     const suffix = qs.toString() ? `?${qs.toString()}` : '';
     return this.request(`/vault/files${suffix}`, {}, vaultToken);
   }
@@ -352,10 +512,14 @@ export class GunyDriveApi {
     const safeName = file.name.replace(/[/\\:*?"<>|]/g, '_');
     const target = new File(downloadsDir, `${file.id.slice(0, 8)}_${safeName}`);
 
-    const downloaded = await File.downloadFileAsync(this.contentUrl(file.id), target, {
-      headers: this.authHeaders(vaultToken),
-      idempotent: true,
-    });
+    const downloaded = await File.downloadFileAsync(
+      this.contentUrl(file.id, false, Boolean(file.deleted_at)),
+      target,
+      {
+        headers: this.authHeaders(vaultToken),
+        idempotent: true,
+      },
+    );
 
     const actualSha = (await downloaded.digest('SHA-256')).toLowerCase();
     const verified = actualSha === file.sha256.toLowerCase();

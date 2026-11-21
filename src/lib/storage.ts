@@ -1,4 +1,5 @@
-import * as SQLite from 'expo-sqlite';
+import { loadCredentials } from './credentials';
+import type { SQLiteDatabase } from 'expo-sqlite';
 
 import {
   QueueItem,
@@ -16,12 +17,16 @@ export type {
   WorkerTriggerType,
 } from './storage.types';
 
-let dbPromise: Promise<SQLite.SQLiteDatabase> | null = null;
+const databases = new Map<string, Promise<SQLiteDatabase>>();
 
-async function getDb(): Promise<SQLite.SQLiteDatabase> {
+async function getDb(shared = false): Promise<SQLiteDatabase> {
+  const creds = await loadCredentials();
+  const dbName = shared ? 'gunydrive.db' : creds ? (creds.accountKey ? 'drive-'+creds.accountKey+'.db' : 'gunydrive.db') : 'guest.db';
+  let dbPromise = databases.get(dbName);
   if (!dbPromise) {
     dbPromise = (async () => {
-      const db = await SQLite.openDatabaseAsync('gunydrive.db');
+      const { openDatabaseAsync } = await import('expo-sqlite');
+      const db = await openDatabaseAsync(dbName);
       await db.execAsync(`
         PRAGMA journal_mode = WAL;
         CREATE TABLE IF NOT EXISTS preferences (
@@ -65,19 +70,59 @@ async function getDb(): Promise<SQLite.SQLiteDatabase> {
           last_checkpoint_offset INTEGER NOT NULL DEFAULT 0,
           delay_reason TEXT
         );
+        CREATE TABLE IF NOT EXISTS device_catalog_cache (
+          cache_key TEXT PRIMARY KEY NOT NULL,
+          payload TEXT NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS idx_queue_status ON backup_queue(status, created_at);
         CREATE INDEX IF NOT EXISTS idx_queue_source ON backup_queue(source_asset_id, source_revision);
         CREATE INDEX IF NOT EXISTS idx_worker_runs_time ON worker_runs(started_at DESC);
       `);
       return db;
-    })();
+    })().catch(error => { databases.delete(dbName); throw error; });
+    databases.set(dbName, dbPromise);
   }
   return dbPromise;
 }
 
+export async function loadDeviceCatalogSnapshot<T>(cacheKey = 'device_v1'): Promise<T | null> {
+  try {
+    const db = await getDb(true);
+    const row = await db.getFirstAsync<{ payload: string }>(
+      'SELECT payload FROM device_catalog_cache WHERE cache_key = ?',
+      [cacheKey],
+    );
+    return row ? (JSON.parse(row.payload) as T) : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function saveDeviceCatalogSnapshot<T>(value: T, cacheKey = 'device_v1'): Promise<void> {
+  try {
+    const db = await getDb(true);
+    await db.runAsync(
+      'INSERT INTO device_catalog_cache (cache_key, payload, updated_at) VALUES (?, ?, ?) ON CONFLICT(cache_key) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at',
+      [cacheKey, JSON.stringify(value), Date.now()],
+    );
+  } catch {
+    // Ignore non-critical cache write failure
+  }
+}
+
+export async function clearDeviceCatalogSnapshot(cacheKey = 'device_v1'): Promise<void> {
+  try {
+    const db = await getDb(true);
+    await db.runAsync('DELETE FROM device_catalog_cache WHERE cache_key = ?', [cacheKey]);
+  } catch {
+    // Ignore non-critical cache clear failure
+  }
+}
+
 export async function getPref<T>(key: string, fallback: T): Promise<T> {
   try {
-    const db = await getDb();
+    const db = await getDb(key === 'appearance_pref_v2' || key === 'app_update_pref_v1');
     const row = await db.getFirstAsync<{ value: string }>(
       'SELECT value FROM preferences WHERE key = ?',
       [key],
@@ -89,7 +134,7 @@ export async function getPref<T>(key: string, fallback: T): Promise<T> {
 }
 
 export async function setPref<T>(key: string, value: T): Promise<void> {
-  const db = await getDb();
+  const db = await getDb(key === 'appearance_pref_v2' || key === 'app_update_pref_v1');
   await db.runAsync(
     'INSERT INTO preferences (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
     [key, JSON.stringify(value)],
@@ -168,14 +213,32 @@ export async function hasSourceInQueue(
 
 export async function upsertQueueItem(item: QueueItem): Promise<void> {
   const db = await getDb();
-  await db.runAsync(
+  await writeQueueItem(db, item, false);
+}
+
+export async function createQueueWriter() {
+  const db = await getDb();
+  return {
+    insert: (item: QueueItem) => writeQueueItem(db, item, true),
+    complete: (id: string, serverId: string, sha: string, size: number) => db.runAsync(
+      `UPDATE backup_queue SET status = 'completed', server_file_id = ?, sha256 = ?, uploaded_offset = ?,
+        error_code = NULL, error_message = NULL, updated_at = ? WHERE id = ?`, [serverId, sha, size, Date.now(), id]),
+    requestManual: (id: string) => db.runAsync(
+      `UPDATE backup_queue SET source_type = 'manual',
+        status = CASE WHEN status IN ('failed', 'paused', 'skipped') THEN 'pending' ELSE status END,
+        next_retry_at = NULL WHERE id = ? AND status != 'completed'`, [id]),
+  };
+}
+
+async function writeQueueItem(db: SQLiteDatabase, item: QueueItem, insertOnly: boolean) {
+  const result = await db.runAsync(
     `INSERT INTO backup_queue (
       id, idempotency_key, source_type, source_asset_id, source_revision,
       local_uri, filename, mime_type, size_bytes, sha256, space, folder_id,
       upload_session_id, uploaded_offset, status, error_code, error_message,
       attempts, next_retry_at, server_file_id, created_at, updated_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(id) DO UPDATE SET
+    ${insertOnly ? 'ON CONFLICT DO NOTHING' : `ON CONFLICT(id) DO UPDATE SET
       sha256 = excluded.sha256,
       upload_session_id = excluded.upload_session_id,
       uploaded_offset = excluded.uploaded_offset,
@@ -185,7 +248,7 @@ export async function upsertQueueItem(item: QueueItem): Promise<void> {
       attempts = excluded.attempts,
       next_retry_at = excluded.next_retry_at,
       server_file_id = excluded.server_file_id,
-      updated_at = excluded.updated_at`,
+      updated_at = excluded.updated_at`}`,
     [
       item.id,
       item.idempotencyKey,
@@ -211,6 +274,7 @@ export async function upsertQueueItem(item: QueueItem): Promise<void> {
       item.updatedAt,
     ],
   );
+  return result.changes > 0;
 }
 
 export async function removeQueueItem(id: string): Promise<void> {

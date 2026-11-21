@@ -9,11 +9,12 @@ export default function TabsLayout() {
       tabBar={(props) => <FloatingTabBar {...props} />}
       screenOptions={{
         headerShown: false,
+        animation: 'shift',
       }}>
       <Tabs.Screen name="index" options={{ title: 'Berkas' }} />
-      <Tabs.Screen name="foto" options={{ title: 'Foto' }} />
-      <Tabs.Screen name="backup" options={{ title: 'Backup' }} />
+      <Tabs.Screen name="foto" options={{ title: 'File' }} />
       <Tabs.Screen name="privat" options={{ title: 'Privat' }} />
+      <Tabs.Screen name="backup" options={{ title: 'Pengaturan' }} />
     </Tabs>
   );
 }

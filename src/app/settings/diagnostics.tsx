@@ -1,3 +1,4 @@
+import { ActionPressable } from '@/components/ui/ActionPressable';
 import * as BackgroundTask from 'expo-background-task';
 import * as Device from 'expo-device';
 import * as TaskManager from 'expo-task-manager';
@@ -15,7 +16,6 @@ import React, { useCallback, useEffect, useState } from 'react';
 import {
   Alert,
   Platform,
-  Pressable,
   ScrollView,
   Share,
   StyleSheet,
@@ -163,7 +163,7 @@ export default function DiagnosticsScreen() {
     <AuroraBackdrop>
       <SafeAreaView style={styles.safe} edges={['top', 'bottom']}>
         <ScrollView contentContainerStyle={styles.scrollPad}>
-          <Pressable
+          <ActionPressable
             onPress={() => router.back()}
             style={styles.backRow}
             accessibilityRole="button">
@@ -171,7 +171,7 @@ export default function DiagnosticsScreen() {
             <AppText weight="semibold" size={15} color="accent">
               Pengaturan
             </AppText>
-          </Pressable>
+          </ActionPressable>
 
           <AppText weight="extrabold" size={28} style={styles.title}>
             Diagnostik Backup
@@ -205,7 +205,7 @@ export default function DiagnosticsScreen() {
             </View>
 
             <View style={styles.btnRow}>
-              <Pressable
+              <ActionPressable
                 disabled={busy}
                 onPress={() => void handleDebugTrigger()}
                 style={[styles.btnPrimary, { backgroundColor: palette.accent }]}>
@@ -213,9 +213,9 @@ export default function DiagnosticsScreen() {
                 <AppText weight="bold" size={13} color="onAccent">
                   {busy ? 'Menjalankan…' : 'Picu Debug'}
                 </AppText>
-              </Pressable>
+              </ActionPressable>
 
-              <Pressable
+              <ActionPressable
                 onPress={() => void handleExportReport()}
                 style={[
                   styles.btnGhost,
@@ -229,7 +229,7 @@ export default function DiagnosticsScreen() {
                 <AppText weight="bold" size={13}>
                   Bagikan Laporan
                 </AppText>
-              </Pressable>
+              </ActionPressable>
             </View>
           </Surface>
 
@@ -320,14 +320,14 @@ export default function DiagnosticsScreen() {
                   Jika izin dicabut atau folder dipindah, antrean SQLite tetap terjaga.
                 </AppText>
               </View>
-              <Pressable
+              <ActionPressable
                 onPress={() => void handleAddWatchedFolder()}
                 style={[styles.smallBtn, { backgroundColor: palette.activeBg }]}>
                 <FolderPlus size={16} color={palette.activeFg} />
                 <AppText weight="bold" size={12.5} color="accent">
                   Pilih
                 </AppText>
-              </Pressable>
+              </ActionPressable>
             </View>
 
             {folders.map((folder) => (
@@ -345,21 +345,21 @@ export default function DiagnosticsScreen() {
                   </AppText>
                 </View>
                 {folder.status !== 'active' ? (
-                  <Pressable
+                  <ActionPressable
                     onPress={async () => {
                       await reauthorizeWatchedFolder(folder.id);
                       await loadAll();
                     }}>
                     <RefreshCw size={16} color={palette.accent} />
-                  </Pressable>
+                  </ActionPressable>
                 ) : null}
-                <Pressable
+                <ActionPressable
                   onPress={async () => {
                     await removeWatchedFolder(folder.id);
                     await loadAll();
                   }}>
                   <Trash2 size={16} color={palette.danger} />
-                </Pressable>
+                </ActionPressable>
               </View>
             ))}
           </Surface>

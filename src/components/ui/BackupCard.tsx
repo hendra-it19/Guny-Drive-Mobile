@@ -1,7 +1,8 @@
+import { ActionPressable } from '@/components/ui/ActionPressable';
 import { LinearGradient } from 'expo-linear-gradient';
 import { AlertCircle, Check, ChevronRight, CloudUpload } from 'lucide-react-native';
 import React from 'react';
-import { Pressable, StyleSheet, View } from 'react-native';
+import { StyleSheet, View } from 'react-native';
 
 import { useAppTheme } from '@/context/theme-context';
 import { formatBytes } from '@/lib/format';
@@ -41,7 +42,7 @@ export function BackupCard({
   const iconColor = palette.isMono ? palette.onAccent : badgeColor;
 
   return (
-    <Pressable onPress={onPress} accessibilityRole="button" accessibilityLabel={`${title}. ${subtitle}`}>
+    <ActionPressable onPress={onPress} accessibilityRole="button" accessibilityLabel={`${title}. ${subtitle}`}>
       {({ pressed }) => (
         <Surface style={[styles.card, pressed && { transform: [{ scale: 0.985 }] }]}>
           <View style={styles.row}>
@@ -84,7 +85,7 @@ export function BackupCard({
           </View>
         </Surface>
       )}
-    </Pressable>
+    </ActionPressable>
   );
 }
 

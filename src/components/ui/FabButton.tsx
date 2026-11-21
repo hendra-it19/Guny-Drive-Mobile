@@ -1,11 +1,13 @@
+import { ActionPressable } from '@/components/ui/ActionPressable';
 import { Plus } from 'lucide-react-native';
 import React from 'react';
-import { Platform, Pressable, StyleSheet } from 'react-native';
+import { Platform, StyleSheet } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { useAppTheme } from '@/context/theme-context';
 
 import { AppText } from './AppText';
+import { useStatusPillActive } from './StatusPillBar';
 
 type Props = {
   label?: string;
@@ -16,9 +18,11 @@ type Props = {
 export function FabButton({ label = 'Tambah', onPress, bottomOffset = 94 }: Props) {
   const { palette } = useAppTheme();
   const insets = useSafeAreaInsets();
+  const statusPillActive = useStatusPillActive();
+  const resolvedOffset = statusPillActive ? bottomOffset + 54 : bottomOffset;
 
   return (
-    <Pressable
+    <ActionPressable
       onPress={onPress}
       accessibilityRole="button"
       accessibilityLabel={label}
@@ -26,7 +30,7 @@ export function FabButton({ label = 'Tambah', onPress, bottomOffset = 94 }: Prop
         styles.fab,
         {
           backgroundColor: palette.accent,
-          bottom: Math.max(insets.bottom, 10) + bottomOffset,
+          bottom: Math.max(insets.bottom, 10) + resolvedOffset,
           shadowColor: palette.accent,
           transform: [{ scale: pressed ? 0.96 : 1 }],
         },
@@ -35,7 +39,7 @@ export function FabButton({ label = 'Tambah', onPress, bottomOffset = 94 }: Prop
       <AppText weight="bold" size={15} color="onAccent">
         {label}
       </AppText>
-    </Pressable>
+    </ActionPressable>
   );
 }
 

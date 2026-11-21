@@ -1,11 +1,13 @@
 import { LinearGradient } from 'expo-linear-gradient';
 import React from 'react';
-import { StyleSheet, View } from 'react-native';
+import { Animated, StyleSheet, View } from 'react-native';
 
+import { useDirectionalShiftAnimation } from '@/components/ui/AnimatedTabContainer';
 import { useAppTheme } from '@/context/theme-context';
 
 export function AuroraBackdrop({ children }: { children: React.ReactNode }) {
   const { palette, useGlass, scheme } = useAppTheme();
+  const { translateX, opacity } = useDirectionalShiftAnimation();
 
   return (
     <View style={[styles.root, { backgroundColor: palette.background }]}>
@@ -50,13 +52,25 @@ export function AuroraBackdrop({ children }: { children: React.ReactNode }) {
           />
         </View>
       ) : null}
-      {children}
+      <Animated.View
+        style={[
+          styles.content,
+          {
+            opacity,
+            transform: [{ translateX }],
+          },
+        ]}>
+        {children}
+      </Animated.View>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
   root: {
+    flex: 1,
+  },
+  content: {
     flex: 1,
   },
   glowTopLeft: {

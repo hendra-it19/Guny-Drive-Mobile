@@ -1,8 +1,11 @@
 import * as Crypto from 'expo-crypto';
-import { Directory, File } from 'expo-file-system';
+import { Directory } from 'expo-file-system';
+import * as FileSystemLegacy from 'expo-file-system/legacy';
 import { Platform } from 'react-native';
 
-import { getPref, hasSourceInQueue, setPref, upsertQueueItem } from './storage';
+import { walkDirectory } from './directory-scan';
+import { createLocalEnqueuer } from './local-backup';
+import { getPref, setPref } from './storage';
 
 const PREF_WATCHED_FOLDERS = 'watched_folders_p1_v1';
 
@@ -26,16 +29,47 @@ export async function saveWatchedFolders(folders: WatchedFolder[]): Promise<void
   await setPref(PREF_WATCHED_FOLDERS, folders);
 }
 
+function cleanSafFolderName(rawName: string, rawUri: string): string {
+  let decoded = rawName || rawUri;
+  try {
+    decoded = decodeURIComponent(decoded);
+  } catch {
+    // Ignore decode error
+  }
+  const clean = decoded.replace(/\/+$/, '');
+  const afterSlash = clean.split('/').pop() ?? clean;
+  const afterColon = afterSlash.split(':').pop() ?? afterSlash;
+  return afterColon.trim() || 'Folder Perangkat';
+}
+
 export async function pickAndAddWatchedFolder(): Promise<WatchedFolder | null> {
   if (Platform.OS === 'web') {
     return null;
   }
 
-  const picked = await Directory.pickDirectoryAsync();
+  let normalizedUri = '';
+  let rawName = '';
+
+  if (Platform.OS === 'android') {
+    // Use StorageAccessFramework directly so Android returns the raw, unmangled SAF tree URI
+    const perm = await FileSystemLegacy.StorageAccessFramework.requestDirectoryPermissionsAsync();
+    if (!perm.granted || !perm.directoryUri) {
+      return null;
+    }
+    normalizedUri = perm.directoryUri;
+    rawName = perm.directoryUri;
+  } else {
+    const picked = await Directory.pickDirectoryAsync();
+    normalizedUri = picked.uri;
+    rawName = picked.name;
+  }
+
+  const label = cleanSafFolderName(rawName, normalizedUri);
   const folders = await listWatchedFolders();
-  const existing = folders.find((f) => f.uri === picked.uri);
+  const existing = folders.find((f) => f.uri === normalizedUri);
 
   if (existing) {
+    existing.label = label;
     existing.status = 'active';
     existing.lastError = null;
     await saveWatchedFolders(folders);
@@ -44,8 +78,8 @@ export async function pickAndAddWatchedFolder(): Promise<WatchedFolder | null> {
 
   const created: WatchedFolder = {
     id: Crypto.randomUUID(),
-    label: picked.name || 'Folder Dokumen',
-    uri: picked.uri,
+    label,
+    uri: normalizedUri,
     platform: Platform.OS,
     status: 'active',
     lastScannedAt: null,
@@ -60,13 +94,25 @@ export async function pickAndAddWatchedFolder(): Promise<WatchedFolder | null> {
 export async function reauthorizeWatchedFolder(folderId: string): Promise<WatchedFolder | null> {
   if (Platform.OS === 'web') return null;
 
-  const picked = await Directory.pickDirectoryAsync();
+  let nextUri = '';
+  let rawName = '';
+  if (Platform.OS === 'android') {
+    const perm = await FileSystemLegacy.StorageAccessFramework.requestDirectoryPermissionsAsync();
+    if (!perm.granted || !perm.directoryUri) return null;
+    nextUri = perm.directoryUri;
+    rawName = perm.directoryUri;
+  } else {
+    const picked = await Directory.pickDirectoryAsync();
+    nextUri = picked.uri;
+    rawName = picked.name;
+  }
+
   const folders = await listWatchedFolders();
   const target = folders.find((f) => f.id === folderId);
   if (!target) return null;
 
-  target.uri = picked.uri;
-  target.label = picked.name || target.label;
+  target.uri = nextUri;
+  target.label = cleanSafFolderName(rawName, nextUri) || target.label;
   target.status = 'active';
   target.lastError = null;
 
@@ -79,78 +125,88 @@ export async function removeWatchedFolder(folderId: string): Promise<void> {
   await saveWatchedFolders(folders.filter((f) => f.id !== folderId));
 }
 
+export type WatchedScanFilter = {
+  includePhotos?: boolean;
+  includeVideos?: boolean;
+  includeDocuments?: boolean;
+  includeAudio?: boolean;
+};
+
+const WF_IMAGE_EXTS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'heic', 'heif', 'bmp', 'avif']);
+const WF_VIDEO_EXTS = new Set(['mp4', 'mov', 'mkv', 'avi', 'webm', '3gp', 'm4v', 'ts']);
+const WF_AUDIO_EXTS = new Set(['mp3', 'wav', 'm4a', 'aac', 'ogg', 'flac', 'opus', 'amr', 'wma', 'aiff']);
+
+function classifyWatchedFile(filename: string, mime?: string): {
+  kind: 'photo' | 'video' | 'audio' | 'document';
+  mimeType: string;
+} {
+  const parts = filename.toLowerCase().split('.');
+  const ext = parts.length > 1 ? (parts[parts.length - 1] ?? '') : '';
+  const m = (mime ?? '').toLowerCase();
+
+  if (WF_IMAGE_EXTS.has(ext) || m.startsWith('image/')) {
+    return { kind: 'photo', mimeType: m.startsWith('image/') ? m : ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg' };
+  }
+  if (WF_VIDEO_EXTS.has(ext) || m.startsWith('video/')) {
+    return { kind: 'video', mimeType: m.startsWith('video/') ? m : 'video/mp4' };
+  }
+  if (WF_AUDIO_EXTS.has(ext) || m.startsWith('audio/')) {
+    return { kind: 'audio', mimeType: m.startsWith('audio/') ? m : ext === 'wav' ? 'audio/wav' : ext === 'm4a' ? 'audio/mp4' : 'audio/mpeg' };
+  }
+  const docMime =
+    ext === 'pdf'
+      ? 'application/pdf'
+      : ext === 'txt' || ext === 'md'
+        ? 'text/plain'
+        : ext === 'json'
+          ? 'application/json'
+          : ext === 'zip'
+            ? 'application/zip'
+            : ext === 'docx' || ext === 'doc'
+              ? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+              : ext === 'xlsx' || ext === 'xls'
+                ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                : m || 'application/octet-stream';
+  return { kind: 'document', mimeType: docMime };
+}
+
 /**
  * Scans all watched document folders (T18 P1 prototype).
  * Preserves existing SQLite queue items even if OS revokes SAF/Files access.
  */
-export async function scanWatchedFolders(): Promise<{
+export async function scanWatchedFolders(filter?: WatchedScanFilter): Promise<{
   enqueued: number;
   needsReauthCount: number;
+  activeFolderCount: number;
 }> {
   if (Platform.OS === 'web') {
-    return { enqueued: 0, needsReauthCount: 0 };
+    return { enqueued: 0, needsReauthCount: 0, activeFolderCount: 0 };
   }
 
   const folders = await listWatchedFolders();
   let enqueued = 0;
   let needsReauthCount = 0;
+  let activeFolderCount = 0;
 
+  const enqueue = await createLocalEnqueuer();
   for (const folder of folders) {
     try {
-      const dir = new Directory(folder.uri);
-      if (!dir.exists) {
-        folder.status = 'needs_reauth';
-        folder.lastError = 'Folder dipindah atau izin dicabut. Pilih ulang folder untuk melanjutkan antrean.';
-        needsReauthCount++;
-        continue;
-      }
-
-      const entries = dir.list();
-      for (const entry of entries) {
-        if (!(entry instanceof File)) {
-          continue;
+      for await (const entry of walkDirectory(folder.uri, folder.label)) {
+        const cleanFilename = cleanSafFolderName(entry.name, entry.uri);
+        const classified = classifyWatchedFile(cleanFilename, entry.mimeType);
+        if (filter) {
+          if (classified.kind === 'photo' && filter.includePhotos === false) continue;
+          if (classified.kind === 'video' && filter.includeVideos === false) continue;
+          if (classified.kind === 'audio' && filter.includeAudio === false) continue;
+          if (classified.kind === 'document' && filter.includeDocuments === false) continue;
         }
-        const sizeBytes = entry.size;
-        const mtime = entry.lastModified ?? 0;
-        const sourceAssetId = `wf:${folder.id}:${entry.name}`;
-        const sourceRevision = `${sizeBytes}:${mtime}`;
-
-        if (await hasSourceInQueue(sourceAssetId, sourceRevision)) {
-          continue;
-        }
-
-        const id = Crypto.randomUUID();
-        const now = Date.now();
-        await upsertQueueItem({
-          id,
-          idempotencyKey: `wf-${folder.id.slice(0, 8)}-${entry.name}-${sourceRevision}`,
-          sourceType: 'watched_folder',
-          sourceAssetId,
-          sourceRevision,
-          localUri: entry.uri,
-          filename: entry.name,
-          mimeType: entry.type || 'application/octet-stream',
-          sizeBytes,
-          sha256: null,
-          space: 'regular',
-          folderId: null,
-          uploadSessionId: null,
-          uploadedOffset: 0,
-          status: 'pending',
-          errorCode: null,
-          errorMessage: null,
-          attempts: 0,
-          nextRetryAt: null,
-          serverFileId: null,
-          createdAt: now,
-          updatedAt: now,
-        });
-        enqueued++;
+        if (await enqueue({ ...entry, name: cleanFilename, mimeType: classified.mimeType }, 'watched_folder')) enqueued++;
       }
 
       folder.status = 'active';
       folder.lastError = null;
       folder.lastScannedAt = Date.now();
+      activeFolderCount++;
     } catch {
       folder.status = 'needs_reauth';
       folder.lastError =
@@ -162,5 +218,5 @@ export async function scanWatchedFolders(): Promise<{
   }
 
   await saveWatchedFolders(folders);
-  return { enqueued, needsReauthCount };
+  return { enqueued, needsReauthCount, activeFolderCount };
 }

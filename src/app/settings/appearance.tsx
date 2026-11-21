@@ -1,3 +1,4 @@
+import { ActionPressable } from '@/components/ui/ActionPressable';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useRouter } from 'expo-router';
 import {
@@ -9,7 +10,7 @@ import {
   Sun,
 } from 'lucide-react-native';
 import React from 'react';
-import { Pressable, ScrollView, StyleSheet, View } from 'react-native';
+import { ScrollView, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { AppText } from '@/components/ui/AppText';
@@ -101,7 +102,7 @@ export default function AppearanceScreen() {
     <AuroraBackdrop>
       <SafeAreaView style={styles.safe} edges={['top', 'bottom']}>
         <ScrollView contentContainerStyle={styles.scrollPad}>
-          <Pressable
+          <ActionPressable
             onPress={() => router.back()}
             style={styles.backRow}
             accessibilityRole="button"
@@ -110,7 +111,7 @@ export default function AppearanceScreen() {
             <AppText weight="semibold" size={15} color="accent">
               Pengaturan
             </AppText>
-          </Pressable>
+          </ActionPressable>
 
           <AppText weight="extrabold" size={32} style={styles.title}>
             Tampilan
@@ -127,7 +128,7 @@ export default function AppearanceScreen() {
             {THEME_LIST.map((item, idx) => {
               const selected = item.id === themeId;
               return (
-                <Pressable
+                <ActionPressable
                   key={item.id}
                   onPress={() => setThemeId(item.id)}
                   accessibilityRole="radio"
@@ -158,7 +159,7 @@ export default function AppearanceScreen() {
                       <Check size={14} color={palette.onAccent} strokeWidth={3} />
                     ) : null}
                   </View>
-                </Pressable>
+                </ActionPressable>
               );
             })}
           </Surface>

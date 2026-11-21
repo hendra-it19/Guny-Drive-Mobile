@@ -1,56 +1,76 @@
-# Welcome to your Expo app 👋
+# GunyDrive Mobile
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+Aplikasi mobile Android & iOS berbasis **Expo SDK 58**, **React Native 0.88**, **TypeScript**, dan **Expo Router**. Terhubung ke backend Laravel GunyDrive melalui HTTPS, memakai **SQLite lokal** untuk katalog perangkat, antrean resumable, dan riwayat worker, serta **SecureStore** untuk kredensial perangkat.
 
-## Get started
+- Repositori Mobile: [hendra-it19/Guny-Drive-Mobile](https://github.com/hendra-it19/Guny-Drive-Mobile)
+- Repositori Induk: [hendra-it19/Guny-Drive](https://github.com/hendra-it19/Guny-Drive)
 
-1. Install dependencies
+---
 
-   ```bash
-   npm install
-   ```
+## Fitur Utama
 
-2. Start the app
+| Tab / Layar | Fitur |
+| --- | --- |
+| **Berkas** | Terdiri dari **Sistem HP** (katalog lokal tersimpan di SQLite + *delta scan* instan tanpa scan ulang berat, *multi-select* upload langsung tanpa salinan ganda) dan **Cloud Server** (*file manager* lengkap: *multi-select*, salin, potong, tempel, ubah nama, buat/hapus folder, *infinite scroll*). |
+| **File** | Galeri terpadu hasil backup (**Semua**, **Foto**, **Video**, **Dokumen**) dengan tata letak Daftar / Grid 2 / Grid 3 / Grid 4, pengurutan, pemutar video/audio native, dan pembaca berkas online. |
+| **Privat** | Folder Privat ber-PIN yang terpisah dari berkas biasa, terkunci otomatis saat aplikasi ke latar atau diam 5 menit. |
+| **Pengaturan** | Ringkasan akun & kuota, kontrol backup otomatis (**Foto**, **Video**, **Dokumen**, **Audio**), jadwal latar belakang harian **00:00 (12 malam)**, opsi **Backup Otomatis Berkas Baru** (mode ala Google Foto, mati secara default), **Passkey Biometrik**, **Tema 5×2**, **Sampah Explorer**, Log & Diagnostik, **Pembaruan Aplikasi (GitHub)**, dan **Logout**. |
+| **Sampah** | Tampilan bergaya *file explorer* dengan pratinjau file, grid/list, sorting, pencarian, filter kategori, *multi-select*, pulihkan, dan hapus permanen (retensi 30 hari). |
 
-   ```bash
-   npx expo start
-   ```
+### Thumbnail Cerdas (Ringan & Cepat)
+- **Dokumen & Non-Media** (`PDF`, `Word`, `Excel`, `PowerPoint`, `Text`, `Code`, `Audio`, `Archive`, `File`) dirender langsung memakai komponen vektor native [DefaultFileThumbnail.tsx](src/components/ui/DefaultFileThumbnail.tsx) tanpa request jaringan.
+- **Foto & Video** menampilkan thumbnail teroptimasi `≤ 320px` (WebP/JPEG dari server atau thumbnail lokal Android/iOS), sedangkan berkas asli hanya diunduh saat pengguna membuka pratinjau penuh atau menyimpan berkas.
 
-In the output, you'll find options to open the app in a
+### Deteksi & Pembaruan Otomatis via GitHub Releases
+Aplikasi yang sudah terpasang dapat mendeteksi rilis terbaru secara otomatis dari GitHub Releases dan memperbarui aplikasi langsung dari dalam aplikasi:
 
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
+- **Deteksi Otomatis**: Memeriksa rilis terbaru secara otomatis di latar belakang setelah aplikasi terbuka (dengan *throttle* 3 jam) maupun secara manual lewat **Pengaturan → Pembaruan Aplikasi (GitHub)**.
+- **Notifikasi & Modal Pembaruan**: Menampilkan pemberitahuan di ikon Lonceng Notifikasi dan modal [AppUpdateModal.tsx](src/components/ui/AppUpdateModal.tsx) yang memuat versi lama → baru, catatan rilis, ukuran APK, opsi *Lewati Versi Ini*, dan tombol pembaruan.
+- **Unduh & Pasang Langsung (Android)**:
+  - Mengunduh aset `.apk` langsung ke cache lokal dengan bilah progres waktu nyata (*streaming* ke disk via `expo-file-system`).
+  - Memicu pemasang sistem Android melalui modul native `GunyDeviceCatalog` ([DeviceCatalogModule.kt](modules/device-catalog/android/src/main/java/com/gunydrive/catalog/DeviceCatalogModule.kt) + `UpdateFileProvider` + izin `REQUEST_INSTALL_PACKAGES`). Jika izin instalasi dari sumber tidak dikenal belum aktif, aplikasi mengarahkan pengguna langsung ke pengaturan izin tersebut lalu melanjutkan instalasi tanpa mengunduh ulang.
+  - Pada iOS / Web / rilis tanpa `.apk`, aplikasi membuka halaman GitHub Release terkait.
+- **Konfigurasi Sumber Rilis**: Secara bawaan memeriksa `hendra-it19/Guny-Drive-Mobile` dan `hendra-it19/Guny-Drive` (dikonfigurasi di `extra.githubReleaseRepos` pada [app.json](app.json), dan dapat dioverride dengan variabel lingkungan `EXPO_PUBLIC_GITHUB_REPO=owner/repo`).
 
-You can start developing by editing the files inside the **src/app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
+---
 
-## Get a fresh project
+## Menjalankan & Membangun Aplikasi
 
-When you're ready, run:
+1. Siapkan **Node.js 22.18+**, **npm**, serta [backend Laravel](../guny-drive-backend/README.md) yang dapat diakses ponsel melalui HTTPS.
+2. Pasang dependensi:
 
-```bash
-npm run reset-project
+```sh
+npm ci
 ```
 
-This command will move the starter code to the **example** directory and create a blank **src/app** directory where you can start developing.
+3. Tetapkan URL HTTPS server backend pada variabel `EXPO_PUBLIC_SERVER_URL` atau `DEPLOYED_SERVER_URL` di [src/lib/api.ts](src/lib/api.ts) (tanpa akhiran `/api/v1`).
+4. Bangun development / preview / release build (disarankan karena menyertakan modul native SQLite, `GunyDeviceCatalog`, pemutar video, dan pemasang APK):
 
-### Other setup steps
+```sh
+# Development build Android (APK)
+npx eas-cli build --profile development --platform android
 
-- To set up ESLint for linting, run `npx expo lint`, or follow our guide on ["Using ESLint and Prettier"](https://docs.expo.dev/guides/using-eslint/)
-- If you'd like to set up unit testing, follow our guide on ["Unit Testing with Jest"](https://docs.expo.dev/develop/unit-testing/)
-- Learn more about the TypeScript setup in this template in our guide on ["Using TypeScript"](https://docs.expo.dev/guides/typescript/)
+# Preview / Release APK untuk dibagikan di GitHub Releases
+npx eas-cli build --profile preview --platform android
 
-## Learn more
+# Jalankan Metro server untuk development build
+npx expo start --dev-client
+```
 
-To learn more about developing your project with Expo, look at the following resources:
+### Cara Merilis Pembaruan ke GitHub Releases
+1. Naikkan nomor versi semver di [app.json](app.json) (contoh: `"version": "1.1.0"`).
+2. Bangun APK rilis baru.
+3. Buat **Release** baru di GitHub dengan tag semver yang cocok (misalnya `v1.1.0`), isi catatan perubahan, dan lampirkan berkas `.apk` pada **Assets**.
+4. Aplikasi yang sudah terpasang di perangkat pengguna akan otomatis mendeteksi versi baru tersebut dan menawarkan tombol **Unduh & Pasang Langsung**.
 
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
+---
 
-## Join the community
+## Pemeriksaan Kualitas
 
-Join our community of developers creating universal apps.
+```sh
+npx tsc --noEmit
+npm run lint
+npx expo-doctor
+```
 
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+[Kontrak API v1](../docs/openapi-v1.yaml) · [Matriks Uji Perangkat](../docs/laporan-uji-rilis.md) · [Desain & Tema](../desain.md) · [Panduan Proyek Induk](../README.md)

@@ -9,7 +9,11 @@
     "userInterfaceStyle": "automatic",
     "ios": {
       "bundleIdentifier": "com.gunydrive.mobile",
+      "supportsTablet": true,
       "icon": "./assets/expo.icon",
+      "config": {
+        "usesNonExemptEncryption": false
+      },
       "infoPlist": {
         "NSPhotoLibraryUsageDescription": "GunyDrive membutuhkan akses galeri untuk mencadangkan foto dan video Anda ke server pribadi.",
         "NSPhotoLibraryAddUsageDescription": "GunyDrive membutuhkan izin menyimpan berkas yang dipulihkan ke perangkat Anda."
@@ -63,6 +67,20 @@
       "expo-secure-store",
       "expo-font",
       "expo-sharing",
+      "expo-background-task",
+      [
+        "expo-local-authentication",
+        {
+          "faceIDPermission": "GunyDrive menggunakan Face ID untuk masuk dengan cepat menggunakan Passkey biometrik."
+        }
+      ],
+      [
+        "expo-video",
+        {
+          "supportsBackgroundPlayback": false,
+          "supportsPictureInPicture": true
+        }
+      ],
       [
         "expo-media-library",
         {

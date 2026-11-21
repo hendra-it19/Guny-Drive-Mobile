@@ -59,9 +59,11 @@ npx expo start --dev-client
 
 ### Cara Merilis Pembaruan ke GitHub Releases
 1. Naikkan nomor versi semver di [app.json](app.json) (contoh: `"version": "1.1.0"`).
-2. Bangun APK rilis baru.
+2. Bangun APK rilis melalui **Expo Dashboard → Build from GitHub** menggunakan profil **`production-apk`** (atau **`production`** untuk Play Store `.aab` dan iOS TestFlight `.ipa`).
 3. Buat **Release** baru di GitHub dengan tag semver yang cocok (misalnya `v1.1.0`), isi catatan perubahan, dan lampirkan berkas `.apk` pada **Assets**.
 4. Aplikasi yang sudah terpasang di perangkat pengguna akan otomatis mendeteksi versi baru tersebut dan menawarkan tombol **Unduh & Pasang Langsung**.
+
+Lihat panduan rilis & konfigurasi Expo Dashboard selengkapnya di [Release.md](Release.md).
 
 ---
 

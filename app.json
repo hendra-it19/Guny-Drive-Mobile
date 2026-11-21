@@ -1,16 +1,18 @@
 {
   "expo": {
-    "name": "guny-drive-mobile",
+    "name": "GunyDrive",
     "slug": "guny-drive-mobile",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
-    "scheme": "gunydrivemobile",
+    "scheme": "gunydrive",
     "userInterfaceStyle": "automatic",
     "ios": {
+      "bundleIdentifier": "com.gunydrive.mobile",
       "icon": "./assets/expo.icon"
     },
     "android": {
+      "package": "com.gunydrive.mobile",
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/images/android-icon-foreground.png",
@@ -28,15 +30,42 @@
       [
         "expo-splash-screen",
         {
-          "backgroundColor": "#208AEF",
+          "backgroundColor": "#EEF1FB",
+          "dark": {
+            "backgroundColor": "#080B1A"
+          },
           "image": "./assets/images/splash-icon.png",
           "imageWidth": 76
         }
-      ]
+      ],
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "GunyDrive memerlukan izin galeri untuk mencadangkan foto dan video Anda ke server pribadi.",
+          "savePhotosPermission": "GunyDrive memerlukan izin untuk menyimpan kembali foto dan video yang dipulihkan.",
+          "isAccessMediaLocationEnabled": true
+        }
+      ],
+      "expo-sqlite",
+      "expo-secure-store",
+      "expo-background-task",
+      "expo-sharing",
+      "expo-video"
     ],
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
-    }
+    },
+    "extra": {
+      "router": {
+        "asyncRoutes": {
+          "web": true
+        }
+      },
+      "eas": {
+        "projectId": "9b9e9f79-8c2e-4a17-b932-77f4746d558a"
+      }
+    },
+    "owner": "hendra_it19"
   }
 }
